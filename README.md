@@ -1,5 +1,9 @@
 # AgentFixture
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/assets/banner.png" alt="AgentFixture Banner" width="700" onerror="this.style.display='none'"/>
+</p>
+
 [![CI](https://github.com/aloneangel45/AgentFixture/actions/workflows/ci.yml/badge.svg)](https://github.com/aloneangel45/AgentFixture/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/aloneangel45/AgentFixture)](https://github.com/aloneangel45/AgentFixture/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
