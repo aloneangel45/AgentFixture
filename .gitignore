@@ -1,0 +1,22 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go cache
+.cache/
+
+# AgentFixture local cassettes & sessions
+fixtures/local/
+*.local.yaml
+*.local.json
+
+# OS files
+.DS_Store
+Thumbs.db
