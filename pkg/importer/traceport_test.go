@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 )
 
 const sampleTracePortJSON = `{
@@ -104,15 +105,74 @@ func TestImportTracePortSession(t *testing.T) {
 		t.Errorf("expected tool result to contain auth package, got %s", toolTurn.Response.ToolResult)
 	}
 
-	// Secret masking verification
+	// Secret masking & zero secret hash oracle verification
 	apiKeyValue := toolTurn.Request.ToolInput["api_key"]
-	if apiKeyValue != "[REDACTED]" && apiKeyValue != "[REDACTED_ANTHROPIC_KEY]" {
-		t.Errorf("expected api_key argument to be redacted, got %v", apiKeyValue)
+	if apiKeyValue != "[REDACTED]" {
+		t.Errorf("expected api_key argument to be [REDACTED], got %v", apiKeyValue)
+	}
+
+	// Replaying with a dummy CI key must match StrictHash 100%!
+	strict := matcher.NewStrictMatcher()
+	replayCandidate := &cassette.Request{
+		ToolName: "view_file",
+		ToolInput: map[string]interface{}{
+			"path":    "pkg/auth/auth.go",
+			"api_key": "ci-dummy-placeholder-key",
+		},
+	}
+	if res := strict.Match(&toolTurn.Request, replayCandidate); !res.Matched {
+		t.Fatalf("StrictHash oracle leak / mismatch when replaying with dummy CI key: %s", res.Diff)
 	}
 
 	// Metrics
 	if cas.Metadata.Metrics.TotalInteractions != 2 {
 		t.Errorf("expected 2 total interactions in metrics, got %d", cas.Metadata.Metrics.TotalInteractions)
+	}
+}
+
+func TestImportTracePortSession_EventErrorFrames(t *testing.T) {
+	errSession := `{
+	  "id": "trace_errors_01",
+	  "command": "agent --api-key=sk-ant-api03-1234567890abcdef1234567890",
+	  "start_time": "2026-11-10T10:00:00Z",
+	  "status": "failed",
+	  "frames": [
+	    {
+	      "index": 1,
+	      "timestamp": "2026-11-10T10:00:01Z",
+	      "type": "tool_call",
+	      "tool": {"name": "exec_cmd", "arguments": {"cmd": "false"}}
+	    },
+	    {
+	      "index": 2,
+	      "timestamp": "2026-11-10T10:00:02Z",
+	      "type": "error",
+	      "content": "exit status 1: permission denied"
+	    },
+	    {
+	      "index": 3,
+	      "timestamp": "2026-11-10T10:00:03Z",
+	      "type": "error",
+	      "content": "upstream rate limit exceeded (token sk-ant-api03-1234567890abcdef1234567890)"
+	    }
+	  ]
+	}`
+
+	cas, err := ImportTracePortSession([]byte(errSession))
+	if err != nil {
+		t.Fatalf("ImportTracePortSession failed: %v", err)
+	}
+	if len(cas.Interactions) != 2 {
+		t.Fatalf("expected 2 interactions (paired tool error + standalone error), got %d", len(cas.Interactions))
+	}
+	if cas.Interactions[0].Response.StatusCode != 500 || !strings.Contains(cas.Interactions[0].Response.Error, "permission denied") {
+		t.Errorf("unexpected paired tool error interaction: %+v", cas.Interactions[0].Response)
+	}
+	if cas.Interactions[1].ID != "tp_err_3" || cas.Interactions[1].Response.StatusCode != 500 {
+		t.Errorf("unexpected standalone error interaction: %+v", cas.Interactions[1])
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(cas); hasSec {
+		t.Fatalf("unredacted secret found in error session import: %s", reason)
 	}
 }
 
@@ -141,5 +201,43 @@ func TestImportTracePortFile(t *testing.T) {
 	}
 	if len(loaded.Interactions) != 2 {
 		t.Errorf("expected 2 interactions in reloaded cassette, got %d", len(loaded.Interactions))
+	}
+}
+
+func TestImportTracePortFile_SplitV11MetaAndJSONL(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaPath := filepath.Join(tmpDir, "trace_v11_01.meta.json")
+	framesPath := filepath.Join(tmpDir, "trace_v11_01.frames.jsonl")
+	outPath := filepath.Join(tmpDir, "v11.yaml")
+
+	metaJSON := `{"id":"trace_v11_01","command":"claude --api-key=sk-ant-api03-secret999999999999","start_time":"2026-11-10T12:00:00Z","status":"completed","frame_count":3}`
+	framesJSONL := strings.Join([]string{
+		`{"index":1,"timestamp":"2026-11-10T12:00:01Z","type":"checkpoint","content":"Initial flight snapshot","git_snapshot":"zstd:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}`,
+		`{"index":2,"timestamp":"2026-11-10T12:00:02Z","type":"tool_call","tool":{"name":"read_file","arguments":{"path":"main.go"}}}`,
+		`{"index":3,"timestamp":"2026-11-10T12:00:03Z","type":"tool_result","content":"package main"}`,
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(metaPath, []byte(metaJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(framesPath, []byte(framesJSONL), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test importing via .meta.json, .frames.jsonl, and bare session prefix
+	for _, inputPath := range []string{metaPath, framesPath, filepath.Join(tmpDir, "trace_v11_01")} {
+		cas, err := ImportTracePortFile(inputPath, outPath)
+		if err != nil {
+			t.Fatalf("ImportTracePortFile(%s) failed: %v", inputPath, err)
+		}
+		if len(cas.Interactions) != 1 || cas.Interactions[0].Request.ToolName != "read_file" {
+			t.Fatalf("unexpected imported interactions from %s: %+v", inputPath, cas.Interactions)
+		}
+		if !strings.HasPrefix(cas.Metadata.Tags["git_snapshot"], "zstd:") {
+			t.Errorf("expected zstd checkpoint tag preserved, got %q", cas.Metadata.Tags["git_snapshot"])
+		}
+		if hasSec, reason := cassette.CheckForUnredactedSecrets(cas); hasSec {
+			t.Fatalf("unredacted secret in split v1.1 import: %s", reason)
+		}
 	}
 }

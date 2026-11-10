@@ -20,5 +20,5 @@ A clear and concise description of what you expected to happen.
 
 **Environment:**
  - OS: [e.g. Ubuntu 24.04, Windows 11, macOS Sequoia]
- - Go Version: [e.g. 1.22.4]
- - AgentFixture Version: [e.g. 1.0.0]
+ - Go Version: [e.g. 1.23]
+ - AgentFixture Version: [e.g. 1.1.0]

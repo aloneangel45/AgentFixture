@@ -1,6 +1,7 @@
 package cassette
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -16,6 +17,7 @@ const (
 	InteractionTypeLLMChat InteractionType = "llm_chat"
 	InteractionTypeTool    InteractionType = "tool_execution"
 	InteractionTypeHTTP    InteractionType = "http"
+	InteractionTypeSSE     InteractionType = "sse"
 	InteractionTypeStdio   InteractionType = "stdio"
 )
 
@@ -83,13 +85,14 @@ type FuzzySignature struct {
 	Model              string                 `json:"model,omitempty" yaml:"model,omitempty"`
 }
 
-// Response captures the recorded result, HTTP status, or tool output.
+// Response captures the recorded result, HTTP status, SSE stream, or tool output.
 type Response struct {
 	StatusCode int               `json:"status_code" yaml:"status_code"`
 	LatencyMs  int64             `json:"latency_ms,omitempty" yaml:"latency_ms,omitempty"`
 	Headers    map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Body       interface{}       `json:"body,omitempty" yaml:"body,omitempty"`
 	RawBody    string            `json:"raw_body,omitempty" yaml:"raw_body,omitempty"`
+	SSEEvents  []SSEEvent        `json:"sse_events,omitempty" yaml:"sse_events,omitempty"`
 	ToolResult string            `json:"tool_result,omitempty" yaml:"tool_result,omitempty"`
 	Error      string            `json:"error,omitempty" yaml:"error,omitempty"`
 	Usage      Usage             `json:"usage,omitempty" yaml:"usage,omitempty"`
@@ -97,9 +100,11 @@ type Response struct {
 
 // Usage tracks token counts reported by the upstream model provider.
 type Usage struct {
-	InputTokens  int `json:"input_tokens,omitempty" yaml:"input_tokens,omitempty"`
-	OutputTokens int `json:"output_tokens,omitempty" yaml:"output_tokens,omitempty"`
-	TotalTokens  int `json:"total_tokens,omitempty" yaml:"total_tokens,omitempty"`
+	InputTokens              int `json:"input_tokens,omitempty" yaml:"input_tokens,omitempty"`
+	OutputTokens             int `json:"output_tokens,omitempty" yaml:"output_tokens,omitempty"`
+	TotalTokens              int `json:"total_tokens,omitempty" yaml:"total_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty" yaml:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty" yaml:"cache_read_input_tokens,omitempty"`
 }
 
 // NewCassette creates an initialized, schema-compliant Cassette instance.
@@ -109,10 +114,117 @@ func NewCassette(cassetteID string) *Cassette {
 		Metadata: Metadata{
 			CassetteID: cassetteID,
 			RecordedAt: time.Now().UTC(),
-			Generator:  "AgentFixture v1.0.0",
+			Generator:  "AgentFixture v1.1.0",
 			Tags:       make(map[string]string),
 		},
 		Interactions: make([]Interaction, 0),
+	}
+}
+
+// Clone returns a deep copy of the Cassette safe for concurrent serialization or mutation.
+func (c *Cassette) Clone() *Cassette {
+	if c == nil {
+		return nil
+	}
+	out := &Cassette{
+		Version:  c.Version,
+		Metadata: c.Metadata,
+	}
+	if c.Metadata.Tags != nil {
+		out.Metadata.Tags = cloneStringMap(c.Metadata.Tags)
+	}
+	if c.Interactions != nil {
+		out.Interactions = make([]Interaction, len(c.Interactions))
+		for i := range c.Interactions {
+			out.Interactions[i] = c.Interactions[i].Clone()
+		}
+	}
+	return out
+}
+
+// Clone returns a deep copy of an Interaction.
+func (inter Interaction) Clone() Interaction {
+	cp := inter
+	cp.Metadata = cloneStringMap(inter.Metadata)
+	cp.Request = inter.Request.Clone()
+	cp.Response = inter.Response.Clone()
+	return cp
+}
+
+// Clone returns a deep copy of a Request.
+func (r Request) Clone() Request {
+	cp := r
+	cp.Headers = cloneStringMap(r.Headers)
+	cp.Body = cloneAny(r.Body)
+	cp.ToolInput = cloneAnyMap(r.ToolInput)
+	cp.Matcher.FuzzySignature.NormalizedArgs = cloneAnyMap(r.Matcher.FuzzySignature.NormalizedArgs)
+	return cp
+}
+
+// Clone returns a deep copy of a Response.
+func (r Response) Clone() Response {
+	cp := r
+	cp.Headers = cloneStringMap(r.Headers)
+	cp.Body = cloneAny(r.Body)
+	if r.SSEEvents != nil {
+		cp.SSEEvents = make([]SSEEvent, len(r.SSEEvents))
+		copy(cp.SSEEvents, r.SSEEvents)
+	}
+	return cp
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func cloneAnyMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		cp[k] = cloneAny(v)
+	}
+	return cp
+}
+
+func cloneAny(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case map[string]interface{}:
+		return cloneAnyMap(val)
+	case []interface{}:
+		cp := make([]interface{}, len(val))
+		for i, el := range val {
+			cp[i] = cloneAny(el)
+		}
+		return cp
+	case map[string]string:
+		return cloneStringMap(val)
+	default:
+		// For custom structs/slices, fallback via JSON if needed; primitives copy by value.
+		switch val.(type) {
+		case string, bool, int, int64, int32, float64, float32, uint, uint64, json.Number:
+			return val
+		}
+		b, err := json.Marshal(val)
+		if err != nil {
+			return val
+		}
+		var cloned interface{}
+		if err := json.Unmarshal(b, &cloned); err != nil {
+			return val
+		}
+		return cloned
 	}
 }
 
@@ -138,24 +250,68 @@ func (c *Cassette) Validate() error {
 		if inter.Type == "" {
 			return fmt.Errorf("interaction '%s' missing type", inter.ID)
 		}
+		for j, ev := range inter.Response.SSEEvents {
+			if ev.Index < 0 {
+				return fmt.Errorf("interaction '%s' sse_event at index %d has negative index %d", inter.ID, j, ev.Index)
+			}
+		}
 	}
 	return nil
 }
 
 // ComputeMetrics recalculates interaction totals and estimated savings.
-// Estimates cost based on Anthropic Claude Sonnet standard rates ($3/M in, $15/M out).
+// Estimates cost based on Anthropic Claude Sonnet standard rates ($3/M in, $15/M out,
+// $3.75/M cache write, $0.30/M cache read) when input/output usage is present, or a
+// blended $6/M rate when only aggregate or heuristic token counts are available.
 func (c *Cassette) ComputeMetrics() {
 	var totalTokens int64
 	var totalLatency int64
+	var totalCost float64
+
 	for _, inter := range c.Interactions {
-		totalLatency += inter.Response.LatencyMs
-		if inter.Response.Usage.TotalTokens > 0 {
-			totalTokens += int64(inter.Response.Usage.TotalTokens)
+		if inter.Response.LatencyMs > 0 {
+			totalLatency += inter.Response.LatencyMs
+		} else if len(inter.Response.SSEEvents) > 0 {
+			for _, ev := range inter.Response.SSEEvents {
+				totalLatency += ev.DeltaMs
+			}
+		}
+
+		u := inter.Response.Usage
+		if u.TotalTokens == 0 && u.InputTokens == 0 && u.OutputTokens == 0 &&
+			u.CacheCreationInputTokens == 0 && u.CacheReadInputTokens == 0 &&
+			len(inter.Response.SSEEvents) > 0 {
+			u = ReconstructStreamSummary(inter.Response.SSEEvents).Usage
+		}
+
+		hasGranular := u.InputTokens > 0 || u.OutputTokens > 0 ||
+			u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0
+
+		if hasGranular {
+			tok := u.TotalTokens
+			if tok == 0 {
+				tok = u.InputTokens + u.OutputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+			}
+			totalTokens += int64(tok)
+			totalCost += float64(u.InputTokens)*0.000003 +
+				float64(u.OutputTokens)*0.000015 +
+				float64(u.CacheCreationInputTokens)*0.00000375 +
+				float64(u.CacheReadInputTokens)*0.0000003
+		} else if u.TotalTokens > 0 {
+			totalTokens += int64(u.TotalTokens)
+			totalCost += float64(u.TotalTokens) * 0.000006
 		} else {
 			// Heuristic estimation: ~4 chars per token for text
 			bodyLen := len(inter.Request.RawBody) + len(inter.Response.RawBody) + len(inter.Response.ToolResult)
+			if len(inter.Response.SSEEvents) > 0 && inter.Response.RawBody == "" {
+				for _, ev := range inter.Response.SSEEvents {
+					bodyLen += len(ev.Data)
+				}
+			}
 			if bodyLen > 0 {
-				totalTokens += int64(bodyLen / 4)
+				est := int64(bodyLen / 4)
+				totalTokens += est
+				totalCost += float64(est) * 0.000006
 			}
 		}
 	}
@@ -163,6 +319,5 @@ func (c *Cassette) ComputeMetrics() {
 	c.Metadata.Metrics.TotalInteractions = len(c.Interactions)
 	c.Metadata.Metrics.RecordedDurationMs = totalLatency
 	c.Metadata.Metrics.EstimatedTokensSaved = totalTokens
-	// $3 per million input tokens, $15 per million output tokens -> avg approx $6 per million tokens
-	c.Metadata.Metrics.EstimatedCostSavedUSD = float64(totalTokens) * 0.000006
+	c.Metadata.Metrics.EstimatedCostSavedUSD = totalCost
 }

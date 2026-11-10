@@ -29,30 +29,38 @@ func (s *StrictMatcher) Match(expected, actual *cassette.Request) MatchResult {
 		}
 	}
 
-	expHash := expected.Matcher.StrictHash
-	if expHash == "" {
-		expHash = ComputeRequestHash(expected)
-	}
-
-	actHash := actual.Matcher.StrictHash
-	if actHash == "" {
-		actHash = ComputeRequestHash(actual)
-	}
-
-	if expHash == actHash {
+	actHash := ComputeRequestHash(actual)
+	if expected.Matcher.StrictHash != "" && expected.Matcher.StrictHash == actHash {
 		return MatchResult{
 			Matched: true,
 			Score:   1.0,
 		}
 	}
 
-	// Produce actionable diff explanation
+	var expHash string
+	if hasRequestContent(expected) {
+		expHash = ComputeRequestHash(expected)
+	} else {
+		expHash = expected.Matcher.StrictHash
+	}
+
+	if expHash != "" && expHash == actHash {
+		return MatchResult{
+			Matched: true,
+			Score:   1.0,
+		}
+	}
+
 	diff := s.explainDiff(expected, actual)
 	return MatchResult{
 		Matched: false,
 		Score:   0.0,
 		Diff:    fmt.Sprintf("strict hash mismatch: expected %s, got %s. Details: %s", expHash, actHash, diff),
 	}
+}
+
+func hasRequestContent(r *cassette.Request) bool {
+	return r.ToolName != "" || r.Method != "" || r.Endpoint != "" || r.RawBody != "" || r.Body != nil
 }
 
 func (s *StrictMatcher) explainDiff(expected, actual *cassette.Request) string {
@@ -62,15 +70,19 @@ func (s *StrictMatcher) explainDiff(expected, actual *cassette.Request) string {
 		if expected.ToolName != actual.ToolName {
 			diffs = append(diffs, fmt.Sprintf("tool_name mismatch: expected %q, got %q", expected.ToolName, actual.ToolName))
 		}
-		if !reflect.DeepEqual(expected.ToolInput, actual.ToolInput) {
-			diffs = append(diffs, fmt.Sprintf("tool_input args differ: expected %v, got %v", expected.ToolInput, actual.ToolInput))
+		redExp := canonicalizeValue(cassette.RedactMap(expected.ToolInput))
+		redAct := canonicalizeValue(cassette.RedactMap(actual.ToolInput))
+		if !reflect.DeepEqual(redExp, redAct) {
+			diffs = append(diffs, fmt.Sprintf("tool_input args differ: expected %v, got %v", redExp, redAct))
 		}
 	} else {
 		if !strings.EqualFold(expected.Method, actual.Method) {
 			diffs = append(diffs, fmt.Sprintf("method mismatch: expected %s, got %s", expected.Method, actual.Method))
 		}
-		if expected.Endpoint != actual.Endpoint {
-			diffs = append(diffs, fmt.Sprintf("endpoint mismatch: expected %s, got %s", expected.Endpoint, actual.Endpoint))
+		normExpEnd := NormalizeEndpoint(expected.Endpoint)
+		normActEnd := NormalizeEndpoint(actual.Endpoint)
+		if normExpEnd != normActEnd {
+			diffs = append(diffs, fmt.Sprintf("endpoint mismatch: expected %s, got %s", normExpEnd, normActEnd))
 		}
 		if expected.RawBody != actual.RawBody {
 			diffs = append(diffs, "body content mismatch")
@@ -78,7 +90,7 @@ func (s *StrictMatcher) explainDiff(expected, actual *cassette.Request) string {
 	}
 
 	if len(diffs) == 0 {
-		return "payload structural differences in whitespace, headers, or encoding"
+		return "payload structural differences in JSON values, precision, or encoding"
 	}
 	return strings.Join(diffs, "; ")
 }
