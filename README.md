@@ -9,80 +9,79 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Go Report Card](https://goreportcard.com/badge/github.com/aloneangel45/AgentFixture)](https://goreportcard.com/report/github.com/aloneangel45/AgentFixture)
 
-> **Zero-dollar deterministic CI/CD regression testing cassette runner for AI agents.**
+> **Zero-dollar, zero-network deterministic CI/CD regression testing cassette engine for AI agents.**
 
-`AgentFixture` eliminates the exorbitant API costs and flaky non-determinism of testing autonomous AI coding agents (Claude Code, Cursor, Windsurf, Aider, OpenHands) in Continuous Integration. By converting [TracePort](https://github.com/aloneangel45/traceport) black-box flight recordings into deterministic testing cassettes, AgentFixture allows entire agent test suites to run **instantly in CI with $0 in LLM API bills**.
+`AgentFixture` eliminates live LLM API bills, rate-limit flakiness, and non-deterministic model drift when testing autonomous AI coding agents (Claude Code, Cursor, Aider, OpenHands, custom MCP/HTTP agents) in Continuous Integration. Record live **Anthropic Messages API SSE streams**, **OpenAI streaming completions**, **MCP stdio tool servers**, or ingest [TracePort](https://github.com/aloneangel45/traceport) flight recordings once, then replay entire multi-turn agent suites offline in milliseconds with **$0.00 in token costs**.
 
-```
-                      +-----------------------------+
-                      |   LLM Agent / Claude 3.7    |
-                      +--------------+--------------+
-                                     |
-                          [Tool Requests / Calls]
-                                     v
-                      +-----------------------------+
-                      |          ToolPrune          |  <-- -91.4% Context Bloat Reduction
-                      +--------------+--------------+
-                                     |
-                          [Filtered Tool Calls]
-                                     v
-                      +-----------------------------+
-                      |          TracePort          |  <-- Black-Box Flight Recording & Git Tree Snapshots
-                      +--------------+--------------+
-                                     |
-                        [Flight Session JSON Export]
-                                     v
-                      +-----------------------------+
-                      |        AgentFixture         |  <-- Zero-Dollar Deterministic CI/CD Replay & Regression
-                      +-----------------------------+
+```text
+                      +-----------------------------------+
+                      |   Autonomous Agent / Claude 4.x   |
+                      +-----------------+-----------------+
+                                        |
+                         [HTTP / SSE / MCP Tool Calls]
+                                        v
+                      +-----------------------------------+
+                      |             ToolPrune             |  <-- Context Bloat Reduction
+                      +-----------------+-----------------+
+                                        |
+                           [Filtered Agent Traffic]
+                                        v
+                      +-----------------------------------+
+                      |             TracePort             |  <-- Flight Recording & Git Snapshots
+                      +-----------------+-----------------+
+                                        |
+                        [Live Proxy Tap or JSON Import]
+                                        v
+                      +-----------------------------------+
+                      |           AgentFixture            |  <-- $0 Offline Deterministic CI Replay
+                      +-----------------------------------+
 ```
 
 ---
 
 ## Why AgentFixture?
 
-1. **Eliminate the "Broken Agent Tax"**: Running a 25-test agent suite against Claude 3.7 Sonnet or GPT-4o costs **$5 to $50 per CI run**. For an active team with 15 PR runs daily, that's **$2,250+/month** in burned tokens. With AgentFixture, CI costs are **$0.00**.
-2. **Sub-Second Test Runtimes**: Agent test runs that usually take 5–15 minutes waiting on LLM generation run in **under 500 milliseconds** during cassette replay.
-3. **Flakiness-Proof Determinism**: Temperature drift, LLM provider rate limits (`429 Too Many Requests`), and transient network dropouts no longer cause false-positive build failures.
-4. **TracePort Native Synergy**: TracePort records actual developer terminal agent sessions; AgentFixture ingests those flight recordings into permanent regression fixtures with one command.
-5. **Zero Secret Leaks**: Built-in automated secret redactor scrubs Anthropic keys (`sk-ant-*`), OpenAI keys (`sk-*`), GitHub tokens (`ghp_*`, `github_pat_*`), Bearer tokens, and sensitive headers before cassettes ever touch git.
+1. **Zero LLM Spend in CI**: Running a 25-test coding agent suite against Claude Sonnet or GPT-4o costs $5 to $50 per CI run ($2,250+/month across active pull requests). Replaying cassettes costs **$0.00**.
+2. **Full Anthropic & OpenAI SSE Streaming Fidelity**: Records and replays raw Server-Sent Event streams (`message_start`, `thinking_delta`, `signature_delta`, `text_delta`, `input_json_delta`, `citations_delta`, `message_delta`, `message_stop`, and OpenAI `data: [DONE]`) with `instant` (`0ms`), `scaled`, or `exact` chunk timing.
+3. **Strict Zero-Outbound-Network Enforcement**: Rejects `HTTP CONNECT` tunnels (`403 Forbidden`), locks `proxy.NewOfflineHTTPClient` strictly to loopback (`127.0.0.1`, `::1`, `localhost`), and injects offline SDK keys so tests cannot leak external traffic.
+4. **Stateful Multi-Turn & MCP Framing**: Replays identical sequential requests in turn order before idempotent fallback, and supports both NDJSON and `Content-Length` MCP stdio framing up to 16 MB.
+5. **Pre-Hash Secret Redaction**: Scrubs Anthropic, OpenAI, Google, GitHub, AWS, Slack, HuggingFace, Bearer, Cookie, URL basic-auth, and PEM credentials *before* computing SHA-256 `StrictHash` digests—eliminating secret hash oracles while allowing dummy CI keys to match seamlessly.
 
 ---
 
 ## Architecture
 
-AgentFixture operates as an intelligent VCR proxy and testing harness:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            AgentFixture Architecture                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                        CLI & Go SDK Entrypoint                      │   │
-│   │    (agentfixture record | replay | verify | import | diff)          │   │
-│   └──────────────────────────────────┬──────────────────────────────────┘   │
-│                                      │                                      │
-│                 ┌────────────────────┴────────────────────┐                 │
-│                 ▼                                         ▼                 │
-│   ┌───────────────────────────┐             ┌───────────────────────────┐   │
-│   │   Recording Proxy Engine  │             │ Deterministic Replay Eng. │   │
-│   │   • HTTP Proxy (OpenAI/   │             │ • Strict SHA-256 Matcher  │   │
-│   │     Anthropic API tap)    │             │ • Fuzzy Semantic Matcher  │   │
-│   │   • Stdio / MCP Stream    │             │ • Dynamic Key Exclusion   │   │
-│   │   • Secret Redactor (sk-*)│             │ • Actionable Diff Engine  │   │
-│   └─────────────┬─────────────┘             └─────────────┬─────────────┘   │
-│                 │                                         ▲                 │
-│                 │          ┌───────────────────┐          │                 │
-│                 └─────────►│  Cassette Store   │──────────┘                 │
-│                            │  (YAML / JSON)    │                            │
-│                            └─────────▲─────────┘                            │
-│                                      │                                      │
-│                            ┌─────────┴─────────┐                            │
-│                            │TracePort Importer │                            │
-│                            │(Flight Log -> Cas)│                            │
-│                            └───────────────────┘                            │
-└─────────────────────────────────────────────────────────────────────────────┘
+```text
++-------------------------------------------------------------------------------+
+|                           AgentFixture v1.1 Engine                            |
++-------------------------------------------------------------------------------+
+|                                                                               |
+|  +-------------------------------------------------------------------------+  |
+|  |                       CLI & Go Testing SDK (agenttest)                  |  |
+|  |   (record | replay | verify | inspect | redact | import | diff)         |  |
+|  +------------------------------------+------------------------------------+  |
+|                                       |                                       |
+|                  +--------------------+--------------------+                  |
+|                  |                                         |                  |
+|                  v                                         v                  |
+|  +-------------------------------+         +-------------------------------+  |
+|  |    Recording Tap Engine       |         |  Offline Replay & Guard Eng.  |  |
+|  |  - HTTP & Live SSE Streamer   |         |  - Loopback-Only Dial Guard   |  |
+|  |  - Gzip Auto-Decompression    |         |  - Stateful Multi-Turn Queue  |  |
+|  |  - MCP Stdio Tap (16MB)       |         |  - Instant/Scaled/Exact SSE   |  |
+|  |  - Pre-Hash Secret Redactor   |         |  - Strict 64-bit & Fuzzy O(N) |  |
+|  +---------------+---------------+         +---------------+---------------+  |
+|                  |                                         ^                  |
+|                  |          +-------------------+          |                  |
+|                  +--------->|  Cassette Store   |----------+                  |
+|                             |  (YAML / JSON)    |                             |
+|                             +---------+---------+                             |
+|                                       ^                                       |
+|                             +---------+---------+                             |
+|                             | TracePort Importer|                             |
+|                             | (Flight -> Cas)   |                             |
+|                             +-------------------+                             |
++-------------------------------------------------------------------------------+
 ```
 
 ---
@@ -91,10 +90,10 @@ AgentFixture operates as an intelligent VCR proxy and testing harness:
 
 ### Pre-Compiled Binaries
 
-Download pre-compiled binaries for Windows, Linux, and macOS from the [Releases](https://github.com/aloneangel45/AgentFixture/releases) page.
+Download pre-compiled binaries for Linux (`amd64`/`arm64`), macOS (`amd64`/`arm64`), and Windows (`amd64`/`arm64`) from [Releases](https://github.com/aloneangel45/AgentFixture/releases).
 
 ```bash
-# macOS / Linux (via curl)
+# macOS / Linux
 curl -fsSL https://github.com/aloneangel45/AgentFixture/releases/latest/download/agentfixture-linux-amd64.tar.gz | tar -xz
 sudo mv agentfixture /usr/local/bin/
 
@@ -111,117 +110,198 @@ go install github.com/aloneangel45/AgentFixture/cmd/agentfixture@latest
 
 ---
 
-## Quick Start & CLI Usage
+## CLI Quick Start
 
-### 1. Ingest a TracePort Flight Recording
-Convert any session recorded with `traceport record` into an AgentFixture cassette:
+### 1. Record Live Anthropic / OpenAI SSE Streaming Sessions
+
+```bash
+agentfixture record -cassette fixtures/claude_stream.yaml -upstream https://api.anthropic.com -- python run_agent.py
+```
+
+Record an MCP stdio tool server directly:
+
+```bash
+agentfixture record -mcp -cassette fixtures/mcp_fs.yaml -- npx -y @modelcontextprotocol/server-filesystem .
+```
+
+### 2. Replay Deterministically in CI (`0ms` Instant SSE Mode)
+
+```bash
+agentfixture replay -cassette fixtures/claude_stream.yaml -timing instant -- go test -v ./...
+```
+
+Output:
+```text
+=================================================================
+ AgentFixture Regression Report: cas_record_1794339000
+=================================================================
+ Status:                 PASSED
+ Exit Code:              0
+ Interactions Replayed:  8 / 8 (100.0%)
+ Estimated Tokens Saved: 24150
+ Estimated Cost Saved:   $0.1449 USD
+ Replay Run Duration:    42ms
+=================================================================
+```
+
+Simulate realistic token arrival pacing (`scaled` or `exact`):
+
+```bash
+agentfixture replay -cassette fixtures/claude_stream.yaml -timing scaled -delay-scale 0.25 -max-delay 250ms -- python ui_test.py
+```
+
+### 3. Verify Schema & Secret Redaction
+
+```bash
+agentfixture verify fixtures/claude_stream.yaml
+```
+
+Output:
+```text
+[OK] Cassette fixtures/claude_stream.yaml is VALID and SECURE
+    Version:                agentfixture/v1
+    ID:                     cas_record_1794339000
+    Interactions:           8 (SSE streams: 5)
+    Estimated Tokens Saved: 24150
+    Estimated Cost Saved:   $0.1449 USD
+```
+
+### 4. Inspect Reconstructed SSE Streams & Telemetry
+
+```bash
+agentfixture inspect fixtures/claude_stream.yaml
+agentfixture inspect -json fixtures/claude_stream.yaml
+```
+
+### 5. Scrub Secrets & Semantic Diff Cassettes in CI
+
+```bash
+# Scrub credentials in-place and recompute secret-safe StrictHash digests
+agentfixture redact fixtures/raw_capture.yaml
+
+# Fail CI with non-zero exit code if prompts, tool inputs, or reconstructed SSE outputs drifted
+agentfixture diff -exit-code fixtures/v1.yaml fixtures/v2.yaml
+```
+
+### 6. Ingest TracePort Flight Recordings
+
 ```bash
 agentfixture import -traceport ~/.traceport/sessions/trace_1793907746.json -out fixtures/auth_flow.yaml
 ```
 
-### 2. Verify Cassette Integrity & Redaction
-Ensure the cassette format conforms to `agentfixture/v1` and contains no leaked credentials:
-```bash
-agentfixture verify fixtures/auth_flow.yaml
-```
+---
 
-Output:
-```text
-[✓] Cassette fixtures/auth_flow.yaml is VALID and SECURE
-    Version:              agentfixture/v1
-    ID:                   trace_1793907746
-    Interactions:         8
-    Estimated Tokens Saved: 24,150
-    Estimated Cost Saved:   $0.1449 USD
-```
+## Go Testing SDK (`pkg/agenttest`)
 
-### 3. Replay in CI/CD (Zero-Dollar Test Runner)
-Run your agent's test suite inside GitHub Actions without configuring LLM API keys:
-```bash
-agentfixture replay -cassette fixtures/auth_flow.yaml -- go test -v ./...
-```
+Embed deterministic VCR replay directly inside standard `go test` suites with zero boilerplate and guaranteed offline network isolation:
 
-Output:
-```text
-=================================================================
- AgentFixture Regression Report: trace_1793907746
-=================================================================
- Status:              PASSED
- Exit Code:           0
- Interactions Replayed: 8 / 8 (100.0%)
- Estimated Tokens Saved: 24,150
- Estimated Cost Saved:   $0.1449 USD
- Replay Run Duration:    182ms
-=================================================================
-```
+```go
+package agent_test
 
-### 4. Record a Live Agent Session
-Tap incoming agent API calls to Anthropic or OpenAI and store them in a new cassette:
-```bash
-agentfixture record -cassette fixtures/new_feature.yaml -upstream https://api.anthropic.com -- python run_agent.py
-```
+import (
+	"io"
+	"strings"
+	"testing"
 
-### 5. Diff Two Cassettes (Drift Analysis)
-Compare prompt alterations or tool input changes between cassette versions:
-```bash
-agentfixture diff fixtures/auth_v1.yaml fixtures/auth_v2.yaml
+	"github.com/aloneangel45/AgentFixture/pkg/agenttest"
+	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+)
+
+func TestClaudeStreamingAgent(t *testing.T) {
+	ts := agenttest.NewTestServer(
+		t,
+		"testdata/anthropic_tool_stream.yaml",
+		agenttest.WithStrictExhaustive(true),
+	)
+
+	// ts.HTTPClient() blocks any TCP dial outside 127.0.0.1 / ::1 / localhost
+	resp, err := ts.HTTPClient().Post(
+		ts.URL()+"/v1/messages",
+		"application/json",
+		strings.NewReader(`{"model":"claude-sonnet-4-20250514","stream":true,"messages":[{"role":"user","content":"Search for ReplaySSEStream"}]}`),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	events, err := cassette.DecodeSSE(resp.Body)
+	if err != nil {
+		t.Fatalf("decode sse: %v", err)
+	}
+	summary := cassette.ReconstructStreamSummary(events)
+	if summary.StopReason != "tool_use" || len(summary.ToolCalls) != 1 {
+		t.Fatalf("unexpected stream summary: %+v", summary)
+	}
+}
 ```
 
 ---
 
 ## Cassette Specification (`agentfixture/v1`)
 
-Cassettes can be stored as either **YAML** or **JSON**:
+Cassettes serialize cleanly as **YAML** or **JSON**, supporting `http`, `sse`, `tool_execution`, `stdio`, and `llm_chat` interactions:
 
 ```yaml
 version: "agentfixture/v1"
 metadata:
-  cassette_id: "cas_auth_middleware_01"
-  recorded_at: "2026-11-05T20:30:00Z"
-  generator: "AgentFixture v1.0.0"
-  agent_name: "claude-code"
-  model: "claude-3-7-sonnet-20250219"
+  cassette_id: "cas_anthropic_sse_01"
+  recorded_at: "2026-11-10T16:40:00Z"
+  generator: "AgentFixture v1.1.0"
+  model: "claude-sonnet-4-20250514"
   metrics:
-    total_interactions: 2
-    recorded_duration_ms: 1240
-    estimated_tokens_saved: 14200
-    estimated_cost_saved_usd: 0.0852
-  tags:
-    git_snapshot: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    total_interactions: 1
+    recorded_duration_ms: 410
+    estimated_tokens_saved: 656
+    estimated_cost_saved_usd: 0.0030
 interactions:
-  - id: "tp_step_1"
+  - id: "int_001"
     sequence: 1
-    type: "tool_execution"
+    type: "sse"
     request:
-      tool_name: "view_file"
-      tool_input:
-        path: "pkg/auth/auth.go"
+      method: "POST"
+      endpoint: "/v1/messages?beta=true"
+      headers:
+        X-Api-Key: "[REDACTED]"
+      raw_body: '{"model":"claude-sonnet-4-20250514","stream":true,"messages":[{"role":"user","content":"Inspect auth.go"}]}'
       matcher:
-        strict_hash: "sha256:7e8a9b1c3d..."
-        fuzzy_signature:
-          normalized_tool_name: "view_file"
-          normalized_args:
-            path: "pkg/auth/auth.go"
+        strict_hash: "sha256:8f4c2e..."
     response:
-      status_code: 0
-      latency_ms: 32
-      tool_result: "package auth\n\nfunc ValidateToken(t string) bool { return true }\n"
+      status_code: 200
+      latency_ms: 410
+      sse_events:
+        - index: 0
+          event: "message_start"
+          data: '{"type":"message_start","message":{"id":"msg_01","model":"claude-sonnet-4-20250514","usage":{"input_tokens":412,"output_tokens":1}}}'
+          delta_ms: 12
+        - index: 1
+          event: "content_block_delta"
+          data: '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Inspecting auth.go..."}}'
+          delta_ms: 18
+        - index: 2
+          event: "message_stop"
+          data: '{"type":"message_stop"}'
+          delta_ms: 4
+      usage:
+        input_tokens: 412
+        output_tokens: 94
+        cache_creation_input_tokens: 100
+        cache_read_input_tokens: 50
 ```
 
 ---
 
-## Matching Engines
+## Matching Engines & Benchmarks
 
-| Matcher | Behavior | Use Case |
+| Matcher | Behavior | Latency |
 |---|---|---|
-| **Strict Matcher** | Canonical SHA-256 hash comparison across sorted JSON keys, headers, and endpoints. | Production CI assertion; ensures exact reproducibility. |
-| **Fuzzy Matcher** | Normalizes whitespace, ignores dynamic keys (`timestamp`, `nonce`, `request_id`), strips UUIDs and ISO timestamps, uses Levenshtein similarity. | Resilient regression tests where prompt phrasing evolves slightly. |
+| **Strict Matcher** | Secret-redacted SHA-256 hash over canonicalized endpoints, sorted query params, and `UseNumber()` 64-bit exact JSON keys. | `~9.6 us/op` |
+| **Fuzzy Matcher** | Strips dynamic keys (`timestamp`, `nonce`, `request_id`, `trace_id`), normalizes UUIDs/ISO dates, caps exact UTF-8 rune Levenshtein at 4,096 runes, and uses O(N) 4-gram Dice hashing for 100KB+ context windows. | `~12.2 us/op` (short) / `~0.63-0.91 ms/op` (100KB prompt) |
+| **SSE Instant Replay** | Zero-delay streaming playback of recorded Anthropic SSE frames. | `~1.6 us/op` (`>1.5 GB/s`) |
 
 ---
 
 ## GitHub Actions CI Integration
-
-Add AgentFixture to your repository workflow:
 
 ```yaml
 name: Agent Regression Suite
@@ -242,8 +322,10 @@ jobs:
           go-version: '1.23'
       - name: Install AgentFixture
         run: go install github.com/aloneangel45/AgentFixture/cmd/agentfixture@latest
-      - name: Run Zero-Dollar Agent Regression Test
-        run: agentfixture replay -cassette fixtures/agent_suite.yaml -- go test -v ./...
+      - name: Verify Cassettes Are Leak-Free
+        run: agentfixture verify fixtures/agent_suite.yaml
+      - name: Run Zero-Dollar Offline Agent Regression Suite
+        run: agentfixture replay -cassette fixtures/agent_suite.yaml -timing instant -- go test -v ./...
 ```
 
 ---

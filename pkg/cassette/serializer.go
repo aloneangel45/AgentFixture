@@ -10,11 +10,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ToYAML serializes a Cassette into formatted YAML bytes.
+// ToYAML serializes a Cassette into formatted YAML bytes without mutating the caller's Cassette in place.
 func ToYAML(c *Cassette) ([]byte, error) {
-	c.ComputeMetrics()
-	RedactCassette(c)
-	return yaml.Marshal(c)
+	if c == nil {
+		return nil, fmt.Errorf("cannot serialize nil cassette")
+	}
+	snapshot := c.Clone()
+	snapshot.ComputeMetrics()
+	RedactCassette(snapshot)
+	return yaml.Marshal(snapshot)
 }
 
 // FromYAML parses YAML bytes into a Cassette and validates it.
@@ -29,11 +33,15 @@ func FromYAML(data []byte) (*Cassette, error) {
 	return &c, nil
 }
 
-// ToJSON serializes a Cassette into indented JSON bytes.
+// ToJSON serializes a Cassette into indented JSON bytes without mutating the caller's Cassette in place.
 func ToJSON(c *Cassette) ([]byte, error) {
-	c.ComputeMetrics()
-	RedactCassette(c)
-	return json.MarshalIndent(c, "", "  ")
+	if c == nil {
+		return nil, fmt.Errorf("cannot serialize nil cassette")
+	}
+	snapshot := c.Clone()
+	snapshot.ComputeMetrics()
+	RedactCassette(snapshot)
+	return json.MarshalIndent(snapshot, "", "  ")
 }
 
 // FromJSON parses JSON bytes into a Cassette and validates it.

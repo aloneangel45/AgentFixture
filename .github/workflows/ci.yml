@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**']
   pull_request:
     branches: [main]
 
@@ -27,8 +27,11 @@ jobs:
       - name: Run Go Vet
         run: go vet ./...
 
-      - name: Run Tests
+      - name: Run Unit & Determinism Tests
         run: go test -v -count=1 ./...
 
+      - name: Run SSE & Matcher Benchmarks Smoke Check
+        run: go test -bench=Benchmark -benchmem -benchtime=100ms -run=NONE ./pkg/cassette ./pkg/matcher
+
       - name: Compile CLI Binary
-        run: go build -v ./cmd/agentfixture
+        run: go build -v -ldflags="-s -w -X main.Version=v1.1.0" ./cmd/agentfixture

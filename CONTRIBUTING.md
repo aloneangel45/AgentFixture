@@ -1,11 +1,11 @@
 # Contributing to AgentFixture
 
-Thank you for your interest in contributing to **AgentFixture**! We welcome bug reports, feature suggestions, and pull requests.
+Thank you for your interest in contributing to **AgentFixture**. Bug reports, RFC proposals, and pull requests are welcome.
 
 ## Development Workflow
 
 ### Prerequisites
-- **Go 1.22+**
+- **Go 1.23+**
 - Git
 
 ### Setup
@@ -20,14 +20,16 @@ Thank you for your interest in contributing to **AgentFixture**! We welcome bug 
    git checkout -b feat/your-feature
    ```
 
-### Running Tests & Verification
+### Running Tests, Benchmarks & Verification
 ```bash
-go test -v ./...
 go vet ./...
+go test -v -count=1 ./...
+go test -bench=. -benchmem ./pkg/cassette ./pkg/matcher
 gofmt -s -w .
 ```
 
 ### Pull Requests
-- Keep PRs focused.
-- Ensure all CI tests pass.
+- Keep pull requests focused and atomic.
+- Maintain zero external runtime dependencies beyond `gopkg.in/yaml.v3`.
+- Ensure all CI checks pass across Linux, Windows, and macOS.
 - Fill out the PR template.

@@ -23,14 +23,23 @@ jobs:
           go-version: '1.23'
           cache: true
 
+      - name: Run Verification Suite
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
       - name: Build Multi-Platform Binaries
         run: |
           mkdir -p dist
-          VERSION=${GITHUB_REF_NAME:-v1.0.0}
+          VERSION=${GITHUB_REF_NAME:-v1.1.0}
 
           # Windows amd64
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture-windows-amd64.exe ./cmd/agentfixture
-          cd dist && zip agentfixture-windows-amd64.zip agentfixture-windows-amd64.exe && cd ..
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture.exe ./cmd/agentfixture
+          cd dist && zip agentfixture-windows-amd64.zip agentfixture.exe && rm agentfixture.exe && cd ..
+
+          # Windows arm64
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture.exe ./cmd/agentfixture
+          cd dist && zip agentfixture-windows-arm64.zip agentfixture.exe && rm agentfixture.exe && cd ..
 
           # Linux amd64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture ./cmd/agentfixture
@@ -58,10 +67,12 @@ jobs:
           cd ..
 
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/agentfixture-windows-amd64.zip
+            dist/agentfixture-windows-arm64.zip
             dist/agentfixture-linux-amd64.tar.gz
             dist/agentfixture-linux-arm64.tar.gz
             dist/agentfixture-darwin-amd64.tar.gz

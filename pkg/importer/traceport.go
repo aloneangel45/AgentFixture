@@ -1,8 +1,11 @@
 package importer
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -52,6 +55,7 @@ type TracePortSession struct {
 }
 
 // ImportTracePortSession converts raw TracePort flight recording JSON bytes into a clean Cassette.
+// Redacts all secrets BEFORE computing deterministic StrictHash values so hashes never leak secret oracles.
 func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 	var sess TracePortSession
 	if err := json.Unmarshal(sessionJSON, &sess); err != nil {
@@ -63,59 +67,73 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 		casID = fmt.Sprintf("trace_%d", time.Now().UnixNano())
 	}
 
+	redactedCommand := cassette.RedactString(sess.Command)
+
 	cas := cassette.NewCassette(casID)
 	cas.Metadata.RecordedAt = sess.StartTime
 	cas.Metadata.AgentName = "traceport-agent"
 	cas.Metadata.Source = "traceport_flight_recording"
-	cas.Metadata.Description = fmt.Sprintf("Imported from TracePort flight recording (Command: %s, Status: %s)", sess.Command, sess.Status)
+	cas.Metadata.Description = fmt.Sprintf("Imported from TracePort flight recording (Command: %s, Status: %s)", redactedCommand, sess.Status)
 
 	if cas.Metadata.Tags == nil {
 		cas.Metadata.Tags = make(map[string]string)
 	}
 	cas.Metadata.Tags["traceport_session_id"] = sess.ID
-	cas.Metadata.Tags["command"] = sess.Command
+	cas.Metadata.Tags["command"] = redactedCommand
 	cas.Metadata.Tags["status"] = sess.Status
 
-	// Map frames into interactions
 	seq := 1
 	n := len(sess.Frames)
 
 	for i := 0; i < n; i++ {
 		frame := sess.Frames[i]
 
-		// Record initial workspace checkpoint if available
+		// Record workspace checkpoint if available
 		if frame.Type == EventCheckpoint && frame.GitSnapshot != "" {
 			cas.Metadata.Tags["git_snapshot"] = frame.GitSnapshot
 			continue
 		}
 
-		// Handle tool calls
+		// 1. Handle tool calls (paired with optional tool_result or error frame)
 		if frame.Type == EventToolCall && frame.Tool != nil {
 			toolName := frame.Tool.Name
-			toolArgs := frame.Tool.Arguments
-			if toolArgs == nil {
-				toolArgs = make(map[string]interface{})
+			rawArgs := frame.Tool.Arguments
+			if rawArgs == nil {
+				rawArgs = make(map[string]interface{})
 			}
+			redactedArgs := cassette.RedactMap(rawArgs)
 
-			// Check if result is directly present or in a subsequent tool_result frame
-			toolResult := frame.Tool.Result
+			toolResult := cassette.RedactString(frame.Tool.Result)
+			var errText string
+			statusCode := 0
 			latency := frame.Tool.DurationMs
 
 			if toolResult == "" && i+1 < n {
 				next := sess.Frames[i+1]
-				if next.Type == EventToolResult {
+				switch next.Type {
+				case EventToolResult:
 					if next.Tool != nil && next.Tool.Result != "" {
-						toolResult = next.Tool.Result
+						toolResult = cassette.RedactString(next.Tool.Result)
 						if next.Tool.DurationMs > 0 {
 							latency = next.Tool.DurationMs
 						}
 					} else if next.Content != "" {
-						toolResult = next.Content
+						toolResult = cassette.RedactString(next.Content)
 					}
+					i++
+				case EventError:
+					errText = cassette.RedactString(next.Content)
+					statusCode = 500
+					if latency == 0 && !next.Timestamp.IsZero() && !frame.Timestamp.IsZero() {
+						if d := next.Timestamp.Sub(frame.Timestamp).Milliseconds(); d > 0 {
+							latency = d
+						}
+					}
+					i++
 				}
 			}
 
-			strictHash := matcher.ComputeToolHash(toolName, toolArgs)
+			strictHash := matcher.ComputeToolHash(toolName, redactedArgs)
 
 			inter := cassette.Interaction{
 				ID:       fmt.Sprintf("tp_step_%d", frame.Index),
@@ -123,19 +141,20 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 				Type:     cassette.InteractionTypeTool,
 				Request: cassette.Request{
 					ToolName:  toolName,
-					ToolInput: toolArgs,
+					ToolInput: redactedArgs,
 					Matcher: cassette.MatcherMeta{
 						StrictHash: strictHash,
 						FuzzySignature: cassette.FuzzySignature{
 							NormalizedToolName: strings.ToLower(toolName),
-							NormalizedArgs:     toolArgs,
+							NormalizedArgs:     redactedArgs,
 						},
 					},
 				},
 				Response: cassette.Response{
-					StatusCode: 0,
+					StatusCode: statusCode,
 					LatencyMs:  latency,
 					ToolResult: toolResult,
+					Error:      errText,
 				},
 				Metadata: map[string]string{
 					"traceport_frame_index": fmt.Sprintf("%d", frame.Index),
@@ -149,51 +168,121 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 
 			cas.Interactions = append(cas.Interactions, inter)
 			seq++
-		} else if frame.Type == EventInput && i+1 < n && sess.Frames[i+1].Type == EventOutput {
-			// Paired user input / assistant output
-			outputFrame := sess.Frames[i+1]
+			continue
+		}
+
+		// 2. Paired user input / assistant output (or error response)
+		if frame.Type == EventInput && i+1 < n && (sess.Frames[i+1].Type == EventOutput || sess.Frames[i+1].Type == EventError) {
+			nextFrame := sess.Frames[i+1]
+			redactedInput := cassette.RedactString(frame.Content)
+			redactedNext := cassette.RedactString(nextFrame.Content)
+
+			req := cassette.Request{
+				RawBody: redactedInput,
+			}
+			req.Matcher = cassette.MatcherMeta{
+				StrictHash: matcher.ComputeRequestHash(&req),
+				FuzzySignature: cassette.FuzzySignature{
+					NormalizedPrompt: matcher.NormalizeText(redactedInput),
+				},
+			}
+
+			resp := cassette.Response{
+				StatusCode: 200,
+				RawBody:    redactedNext,
+				LatencyMs:  nextFrame.Timestamp.Sub(frame.Timestamp).Milliseconds(),
+			}
+			if nextFrame.Type == EventError {
+				resp.StatusCode = 500
+				resp.RawBody = ""
+				resp.Error = redactedNext
+			}
+
 			inter := cassette.Interaction{
 				ID:       fmt.Sprintf("tp_turn_%d", frame.Index),
 				Sequence: seq,
 				Type:     cassette.InteractionTypeLLMChat,
-				Request: cassette.Request{
-					RawBody: frame.Content,
-					Matcher: cassette.MatcherMeta{
-						StrictHash: matcher.CanonicalHash([]byte(frame.Content)),
-						FuzzySignature: cassette.FuzzySignature{
-							NormalizedPrompt: matcher.NormalizeText(frame.Content),
-						},
-					},
-				},
-				Response: cassette.Response{
-					StatusCode: 200,
-					RawBody:    outputFrame.Content,
-					LatencyMs:  outputFrame.Timestamp.Sub(frame.Timestamp).Milliseconds(),
-				},
+				Request:  req,
+				Response: resp,
 				Metadata: map[string]string{
 					"input_index":  fmt.Sprintf("%d", frame.Index),
-					"output_index": fmt.Sprintf("%d", outputFrame.Index),
+					"output_index": fmt.Sprintf("%d", nextFrame.Index),
 				},
 			}
 			cas.Interactions = append(cas.Interactions, inter)
 			seq++
-			i++ // skip the paired output frame
+			i++
+			continue
+		}
+
+		// 3. Standalone EventError frame (never dropped)
+		if frame.Type == EventError {
+			redactedErr := cassette.RedactString(frame.Content)
+			interType := cassette.InteractionTypeLLMChat
+			var req cassette.Request
+
+			if frame.Tool != nil && frame.Tool.Name != "" {
+				interType = cassette.InteractionTypeTool
+				redArgs := cassette.RedactMap(frame.Tool.Arguments)
+				if redArgs == nil {
+					redArgs = make(map[string]interface{})
+				}
+				req = cassette.Request{
+					ToolName:  frame.Tool.Name,
+					ToolInput: redArgs,
+					Matcher: cassette.MatcherMeta{
+						StrictHash: matcher.ComputeToolHash(frame.Tool.Name, redArgs),
+						FuzzySignature: cassette.FuzzySignature{
+							NormalizedToolName: strings.ToLower(frame.Tool.Name),
+							NormalizedArgs:     redArgs,
+						},
+					},
+				}
+			} else {
+				req = cassette.Request{
+					RawBody: redactedErr,
+				}
+				req.Matcher = cassette.MatcherMeta{
+					StrictHash: matcher.ComputeRequestHash(&req),
+					FuzzySignature: cassette.FuzzySignature{
+						NormalizedPrompt: matcher.NormalizeText(redactedErr),
+					},
+				}
+			}
+
+			inter := cassette.Interaction{
+				ID:       fmt.Sprintf("tp_err_%d", frame.Index),
+				Sequence: seq,
+				Type:     interType,
+				Request:  req,
+				Response: cassette.Response{
+					StatusCode: 500,
+					Error:      redactedErr,
+				},
+				Metadata: map[string]string{
+					"traceport_frame_index": fmt.Sprintf("%d", frame.Index),
+					"event_type":            string(EventError),
+					"timestamp":             frame.Timestamp.Format(time.RFC3339Nano),
+				},
+			}
+			cas.Interactions = append(cas.Interactions, inter)
+			seq++
 		}
 	}
 
-	// Redact sensitive secrets from flight log interactions
 	cassette.RedactCassette(cas)
 	cas.ComputeMetrics()
 
 	return cas, nil
 }
 
-// ImportTracePortFile loads a TracePort session JSON file from disk, converts it,
-// and saves the resulting cassette to the requested output path (YAML or JSON).
+// ImportTracePortFile loads a TracePort session from disk (supporting legacy monolithic .json,
+// `traceport inspect --json` output, and TracePort v1.1+ split .meta.json + .frames.jsonl WAL logs),
+// converts it, and saves the resulting cassette to outputPath (YAML or JSON).
 func ImportTracePortFile(sessionPath, outputPath string) (*cassette.Cassette, error) {
-	data, err := os.ReadFile(sessionPath)
+	data, err := resolveTracePortSessionJSON(sessionPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read traceport session file: %w", err)
+		return nil, err
 	}
 
 	cas, err := ImportTracePortSession(data)
@@ -208,4 +297,69 @@ func ImportTracePortFile(sessionPath, outputPath string) (*cassette.Cassette, er
 	}
 
 	return cas, nil
+}
+
+func resolveTracePortSessionJSON(sessionPath string) ([]byte, error) {
+	switch {
+	case strings.HasSuffix(sessionPath, ".meta.json"):
+		prefix := strings.TrimSuffix(sessionPath, ".meta.json")
+		return assembleSplitTracePortSession(sessionPath, prefix+".frames.jsonl")
+	case strings.HasSuffix(sessionPath, ".frames.jsonl"):
+		prefix := strings.TrimSuffix(sessionPath, ".frames.jsonl")
+		return assembleSplitTracePortSession(prefix+".meta.json", sessionPath)
+	}
+
+	data, err := os.ReadFile(sessionPath)
+	if err == nil {
+		return data, nil
+	}
+
+	// Fallback: check if TracePort v1.1+ split files (<id>.meta.json + <id>.frames.jsonl) exist.
+	prefix := strings.TrimSuffix(sessionPath, ".json")
+	if _, mErr := os.Stat(prefix + ".meta.json"); mErr == nil {
+		return assembleSplitTracePortSession(prefix+".meta.json", prefix+".frames.jsonl")
+	}
+
+	return nil, fmt.Errorf("failed to read traceport session file: %w", err)
+}
+
+func assembleSplitTracePortSession(metaPath, framesPath string) ([]byte, error) {
+	var sess TracePortSession
+	if metaBytes, err := os.ReadFile(metaPath); err == nil {
+		if err := json.Unmarshal(metaBytes, &sess); err != nil {
+			return nil, fmt.Errorf("failed to parse traceport meta file %s: %w", metaPath, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read traceport meta file %s: %w", metaPath, err)
+	}
+
+	f, err := os.Open(framesPath)
+	if err != nil {
+		if os.IsNotExist(err) && sess.ID != "" {
+			return json.Marshal(sess)
+		}
+		return nil, fmt.Errorf("failed to read traceport frames file %s: %w", framesPath, err)
+	}
+	defer f.Close()
+
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			var frame TracePortFrame
+			if err := json.Unmarshal(trimmed, &frame); err != nil {
+				return nil, fmt.Errorf("invalid frame line in %s: %w", framesPath, err)
+			}
+			sess.Frames = append(sess.Frames, frame)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("error reading %s: %w", framesPath, readErr)
+		}
+	}
+
+	return json.Marshal(sess)
 }
