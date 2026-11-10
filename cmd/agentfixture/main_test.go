@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -150,7 +151,11 @@ func TestCLI_RecordCommand_RecordsSubprocessInteractions(t *testing.T) {
 		if err != nil {
 			os.Exit(2)
 		}
+		_, _ = io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(3)
+		}
 		os.Exit(0)
 	}
 

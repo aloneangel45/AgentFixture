@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,6 +53,9 @@ type Server struct {
 	listener       net.Listener
 	httpServer     *http.Server
 	upstreamClient *http.Client
+	inFlightMu     sync.Mutex
+	inFlightCond   *sync.Cond
+	inFlight       int
 	mu             sync.Mutex
 	cassette       *cassette.Cassette
 	matchedIDs     map[string]bool
@@ -111,6 +115,7 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	// Register handler directly (bypassing ServeMux path redirects so HTTP CONNECT and proxy URIs work cleanly).
+	s.inFlightCond = sync.NewCond(&s.inFlightMu)
 	s.httpServer = &http.Server{Handler: http.HandlerFunc(s.handleHTTP)}
 
 	return s, nil
@@ -131,12 +136,28 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Close shuts down the server and releases all network ports.
-func (s *Server) Close() error {
-	if s.httpServer != nil {
-		return s.httpServer.Close()
+// WaitIdle blocks until all active HTTP handler goroutines finish recording or replaying.
+func (s *Server) WaitIdle() {
+	s.inFlightMu.Lock()
+	for s.inFlight > 0 {
+		s.inFlightCond.Wait()
 	}
-	return nil
+	s.inFlightMu.Unlock()
+}
+
+// Close gracefully drains active handlers, shuts down the server, and releases network ports.
+func (s *Server) Close() error {
+	var err error
+	if s.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = s.httpServer.Shutdown(ctx)
+		if err != nil {
+			_ = s.httpServer.Close()
+		}
+	}
+	s.WaitIdle()
+	return err
 }
 
 // Mode returns the configured proxy Mode.
@@ -162,6 +183,7 @@ func (s *Server) URL() string {
 
 // GetCassette returns a thread-safe clone of the Cassette containing recorded or loaded interactions.
 func (s *Server) GetCassette() *cassette.Cassette {
+	s.WaitIdle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cassette.Clone()
@@ -169,6 +191,7 @@ func (s *Server) GetCassette() *cassette.Cassette {
 
 // MatchedCount returns how many unique cassette interactions have been replayed.
 func (s *Server) MatchedCount() int {
+	s.WaitIdle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.matchedIDs)
@@ -176,6 +199,7 @@ func (s *Server) MatchedCount() int {
 
 // MatchedIDs returns a snapshot map of all cassette interaction IDs matched during replay.
 func (s *Server) MatchedIDs() map[string]bool {
+	s.WaitIdle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := make(map[string]bool, len(s.matchedIDs))
@@ -187,6 +211,7 @@ func (s *Server) MatchedIDs() map[string]bool {
 
 // DriftRecords returns any non-exact semantic matches recorded during fuzzy replay.
 func (s *Server) DriftRecords() []DriftRecord {
+	s.WaitIdle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := make([]DriftRecord, len(s.driftRecords))
@@ -196,6 +221,7 @@ func (s *Server) DriftRecords() []DriftRecord {
 
 // UnmatchedRequests returns any requests received during replay that failed to match.
 func (s *Server) UnmatchedRequests() []cassette.Request {
+	s.WaitIdle()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	copied := make([]cassette.Request, len(s.unmatched))
@@ -206,6 +232,17 @@ func (s *Server) UnmatchedRequests() []cassette.Request {
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	s.inFlightMu.Lock()
+	s.inFlight++
+	s.inFlightMu.Unlock()
+	defer func() {
+		s.inFlightMu.Lock()
+		s.inFlight--
+		if s.inFlight == 0 {
+			s.inFlightCond.Broadcast()
+		}
+		s.inFlightMu.Unlock()
+	}()
 	// Zero Outbound Network Guard: strictly forbid HTTPS CONNECT tunneling in replay mode (and unsupported tunnel proxy use).
 	if r.Method == http.MethodConnect {
 		w.Header().Set("Content-Type", "application/json")

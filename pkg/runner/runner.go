@@ -208,7 +208,8 @@ func Run(opts RunOptions) (*TestReport, error) {
 		}
 	}
 
-	// 4. Collect assertions and metrics from server snapshot
+	// 4. Drain any in-flight proxy handler goroutines before reading cassette state
+	srv.WaitIdle()
 	activeCas := srv.GetCassette()
 	activeCas.ComputeMetrics()
 
