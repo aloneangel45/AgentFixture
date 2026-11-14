@@ -104,13 +104,24 @@ try {
         throw "Asset '$Asset' was not found in checksums.txt. Aborting installation."
     }
 
-    $ActualSha = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Sha256Hasher = [System.Security.Cryptography.SHA256]::Create()
+    $ArchiveStream = [System.IO.File]::OpenRead($ArchivePath)
+    try {
+        $ActualSha = [System.BitConverter]::ToString($Sha256Hasher.ComputeHash($ArchiveStream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $ArchiveStream.Dispose()
+        $Sha256Hasher.Dispose()
+    }
     if ($ActualSha -ne $ExpectedSha) {
         throw "SHA-256 checksum mismatch for $Asset! Expected: $ExpectedSha, Actual: $ActualSha"
     }
     Write-AFInfo "SHA-256 verified: $ActualSha"
 
-    Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $ExtractDir) {
+        Remove-Item -LiteralPath $ExtractDir -Recurse -Force
+    }
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $ExtractDir)
     $ExtractedBin = Join-Path $ExtractDir $BinaryName
     if (-not (Test-Path -LiteralPath $ExtractedBin)) {
         throw "Expected binary '$BinaryName' was not found inside $Asset."

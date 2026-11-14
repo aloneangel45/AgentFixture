@@ -575,7 +575,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 		t.Fatalf("missing install.ps1: %v", err)
 	}
 	ps1Text := string(ps1Bytes)
-	for _, needle := range []string{"aloneangel45/AgentFixture", "checksums.txt", "agentfixture-windows-", "Get-FileHash", "SHA256"} {
+	for _, needle := range []string{"aloneangel45/AgentFixture", "checksums.txt", "agentfixture-windows-", "Cryptography.SHA256", "SHA256"} {
 		if !strings.Contains(ps1Text, needle) {
 			t.Errorf("install.ps1 missing expected reference %q", needle)
 		}
