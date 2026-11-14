@@ -107,6 +107,12 @@ type Usage struct {
 	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty" yaml:"cache_read_input_tokens,omitempty"`
 }
 
+// IsZero reports whether all token counters in Usage are zero.
+func (u Usage) IsZero() bool {
+	return u.InputTokens == 0 && u.OutputTokens == 0 && u.TotalTokens == 0 &&
+		u.CacheCreationInputTokens == 0 && u.CacheReadInputTokens == 0
+}
+
 // NewCassette creates an initialized, schema-compliant Cassette instance.
 func NewCassette(cassetteID string) *Cassette {
 	return &Cassette{
@@ -114,7 +120,7 @@ func NewCassette(cassetteID string) *Cassette {
 		Metadata: Metadata{
 			CassetteID: cassetteID,
 			RecordedAt: time.Now().UTC(),
-			Generator:  "AgentFixture v1.1.0",
+			Generator:  "AgentFixture v1.2.0",
 			Tags:       make(map[string]string),
 		},
 		Interactions: make([]Interaction, 0),
@@ -277,12 +283,7 @@ func (c *Cassette) ComputeMetrics() {
 			}
 		}
 
-		u := inter.Response.Usage
-		if u.TotalTokens == 0 && u.InputTokens == 0 && u.OutputTokens == 0 &&
-			u.CacheCreationInputTokens == 0 && u.CacheReadInputTokens == 0 &&
-			len(inter.Response.SSEEvents) > 0 {
-			u = ReconstructStreamSummary(inter.Response.SSEEvents).Usage
-		}
+		u := ExtractResponseUsage(&inter.Response)
 
 		hasGranular := u.InputTokens > 0 || u.OutputTokens > 0 ||
 			u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0

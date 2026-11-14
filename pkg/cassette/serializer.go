@@ -83,14 +83,33 @@ func Save(path string, c *Cassette) error {
 
 // Load reads a Cassette from disk, determining format by file extension.
 func Load(path string) (*Cassette, error) {
+	c, err := LoadUnvalidated(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid cassette structure: %w", err)
+	}
+	return c, nil
+}
+
+// LoadUnvalidated reads and unmarshals a Cassette from disk (YAML or JSON) without running Validate().
+func LoadUnvalidated(path string) (*Cassette, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cassette file %s: %w", path, err)
 	}
 
+	var c Cassette
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".json" {
-		return FromJSON(data)
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal cassette json: %w", err)
+		}
+	} else {
+		if err := yaml.Unmarshal(data, &c); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal cassette yaml: %w", err)
+		}
 	}
-	return FromYAML(data)
+	return &c, nil
 }

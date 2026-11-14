@@ -6,22 +6,26 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
 	"github.com/aloneangel45/AgentFixture/pkg/importer"
+	"github.com/aloneangel45/AgentFixture/pkg/junit"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 	"github.com/aloneangel45/AgentFixture/pkg/proxy"
 	"github.com/aloneangel45/AgentFixture/pkg/runner"
 )
 
 // Version is injected at build time via -ldflags="-X main.Version=...".
-var Version = "1.1.0"
+var Version = "1.2.0"
 
 const (
 	ProgramName = "AgentFixture"
@@ -73,7 +77,7 @@ func main() {
 func formatVersionString(ver string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(ver), "v")
 	if clean == "" {
-		clean = "1.1.0"
+		clean = "1.2.0"
 	}
 	return fmt.Sprintf("%s v%s (%s)", ProgramName, clean, Banner)
 }
@@ -89,9 +93,9 @@ Usage:
   agentfixture <command> [options] [-- <command>]
 
 Commands:
-  record     Record HTTP, SSE streaming, or MCP stdio interactions into a cassette
+  record     Record HTTP, SSE streaming (Anthropic, OpenAI, Gemini), or MCP stdio interactions
   replay     Replay recorded cassette deterministically with zero outbound network calls
-  verify     Validate cassette integrity, schema, and check for unmasked secrets
+  verify     Validate single cassette or recursive directory batch, schema, and secret safety
   inspect    Display cassette telemetry, interaction summary, and reconstructed SSE streams
   redact     Scrub secrets from a cassette file and recompute secret-safe hashes
   import     Ingest TracePort flight recordings and convert to testing cassette
@@ -99,43 +103,77 @@ Commands:
   version    Show version information
 
 Examples:
-  agentfixture verify fixtures/auth_flow.yaml
-  agentfixture inspect fixtures/anthropic_sse.yaml
+  agentfixture verify fixtures/
+  agentfixture verify -json -junit verify-report.xml fixtures/
+  agentfixture inspect fixtures/gemini_sse.yaml
   agentfixture redact fixtures/raw_capture.yaml
   agentfixture import -traceport flight.json -out cassette.yaml
-  agentfixture replay -cassette cassette.yaml -timing instant -- go test ./...
-  agentfixture record -cassette cassette.yaml -upstream https://api.anthropic.com -- python agent.py
+  agentfixture replay -cassette cassette.yaml -timing instant -junit replay-report.xml -- go test ./...
+  agentfixture record -cassette cassette.yaml -upstream https://generativelanguage.googleapis.com -- python agent.py
   agentfixture record -mcp -cassette mcp_tools.yaml -- npx -y @modelcontextprotocol/server-filesystem .
   agentfixture diff -exit-code cassette_v1.yaml cassette_v2.yaml`)
 }
 
-func handleVerify(args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	strictCheck := fs.Bool("strict", true, "Enforce strict schema validation")
-	if err := fs.Parse(args); err != nil {
-		return err
+type verifyFileResult struct {
+	Path                  string  `json:"path"`
+	Valid                 bool    `json:"valid"`
+	Version               string  `json:"version,omitempty"`
+	CassetteID            string  `json:"cassette_id,omitempty"`
+	Interactions          int     `json:"interactions"`
+	SSEStreams            int     `json:"sse_streams"`
+	EstimatedTokensSaved  int64   `json:"estimated_tokens_saved"`
+	EstimatedCostSavedUSD float64 `json:"estimated_cost_saved_usd"`
+	DurationMs            int64   `json:"duration_ms"`
+	ErrorType             string  `json:"error_type,omitempty"`
+	Error                 string  `json:"error,omitempty"`
+	duration              time.Duration
+}
+
+type verifySummaryReport struct {
+	Target                string             `json:"target"`
+	Mode                  string             `json:"mode"`
+	Passed                bool               `json:"passed"`
+	TotalCassettes        int                `json:"total_cassettes"`
+	ValidCassettes        int                `json:"valid_cassettes"`
+	FailedCassettes       int                `json:"failed_cassettes"`
+	TotalInteractions     int                `json:"total_interactions"`
+	TotalSSEStreams       int                `json:"total_sse_streams"`
+	EstimatedTokensSaved  int64              `json:"estimated_tokens_saved"`
+	EstimatedCostSavedUSD float64            `json:"estimated_cost_saved_usd"`
+	Results               []verifyFileResult `json:"results"`
+}
+
+func verifySingleCassetteFile(casPath string, strictCheck bool) (verifyFileResult, error) {
+	start := time.Now()
+	res := verifyFileResult{
+		Path: filepath.ToSlash(casPath),
 	}
 
-	rest := fs.Args()
-	if len(rest) < 1 {
-		return fmt.Errorf("missing cassette path: agentfixture verify <path>")
-	}
-	casPath := rest[0]
-
-	cas, err := cassette.Load(casPath)
+	cas, err := cassette.LoadUnvalidated(casPath)
 	if err != nil {
-		return fmt.Errorf("failed to load cassette: %w", err)
+		res.duration = time.Since(start)
+		res.DurationMs = res.duration.Milliseconds()
+		res.ErrorType = "LoadError"
+		res.Error = fmt.Sprintf("failed to load cassette: %v", err)
+		return res, fmt.Errorf("failed to load cassette: %w", err)
 	}
 
-	if *strictCheck {
-		if err := cas.Validate(); err != nil {
-			return fmt.Errorf("cassette validation failed: %w", err)
+	if strictCheck {
+		if vErr := cas.Validate(); vErr != nil {
+			res.duration = time.Since(start)
+			res.DurationMs = res.duration.Milliseconds()
+			res.ErrorType = "ValidationError"
+			res.Error = fmt.Sprintf("cassette validation failed: %v", vErr)
+			return res, fmt.Errorf("cassette validation failed: %w", vErr)
 		}
 	}
 
-	hasSecrets, secretReason := cassette.CheckForUnredactedSecrets(cas)
-	if hasSecrets {
-		return fmt.Errorf("security violation: %s", secretReason)
+	if hasSecrets, secretReason := cassette.CheckForUnredactedSecrets(cas); hasSecrets {
+		res.duration = time.Since(start)
+		res.DurationMs = res.duration.Milliseconds()
+		res.ErrorType = "SecurityViolation"
+		res.Error = fmt.Sprintf("security violation: %s", secretReason)
+		return res, fmt.Errorf("security violation: %s", secretReason)
 	}
 
 	sseCount := 0
@@ -146,12 +184,255 @@ func handleVerify(args []string) error {
 	}
 
 	cas.ComputeMetrics()
-	fmt.Printf("[OK] Cassette %s is VALID and SECURE\n", casPath)
-	fmt.Printf("    Version:                %s\n", cas.Version)
-	fmt.Printf("    ID:                     %s\n", cas.Metadata.CassetteID)
-	fmt.Printf("    Interactions:           %d (SSE streams: %d)\n", cas.Metadata.Metrics.TotalInteractions, sseCount)
-	fmt.Printf("    Estimated Tokens Saved: %d\n", cas.Metadata.Metrics.EstimatedTokensSaved)
-	fmt.Printf("    Estimated Cost Saved:   $%.4f USD\n", cas.Metadata.Metrics.EstimatedCostSavedUSD)
+	res.duration = time.Since(start)
+	res.DurationMs = res.duration.Milliseconds()
+	res.Valid = true
+	res.Version = cas.Version
+	res.CassetteID = cas.Metadata.CassetteID
+	res.Interactions = cas.Metadata.Metrics.TotalInteractions
+	res.SSEStreams = sseCount
+	res.EstimatedTokensSaved = cas.Metadata.Metrics.EstimatedTokensSaved
+	res.EstimatedCostSavedUSD = cas.Metadata.Metrics.EstimatedCostSavedUSD
+	return res, nil
+}
+
+func discoverCassetteFiles(rootDir string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(d.Name())) {
+		case ".yaml", ".yml", ".json":
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return filepath.ToSlash(files[i]) < filepath.ToSlash(files[j])
+	})
+	return files, nil
+}
+
+func toJUnitVerifyCases(results []verifyFileResult) []junit.VerifyCaseInput {
+	cases := make([]junit.VerifyCaseInput, 0, len(results))
+	for _, r := range results {
+		cases = append(cases, junit.VerifyCaseInput{
+			Path:                  r.Path,
+			CassetteID:            r.CassetteID,
+			Valid:                 r.Valid,
+			Interactions:          r.Interactions,
+			SSEStreams:            r.SSEStreams,
+			EstimatedTokensSaved:  r.EstimatedTokensSaved,
+			EstimatedCostSavedUSD: r.EstimatedCostSavedUSD,
+			Duration:              r.duration,
+			ErrorType:             r.ErrorType,
+			Error:                 r.Error,
+		})
+	}
+	return cases
+}
+
+func handleVerify(args []string) error {
+	flagSet := flag.NewFlagSet("verify", flag.ContinueOnError)
+	strictCheck := flagSet.Bool("strict", true, "Enforce strict schema validation")
+	jsonOut := flagSet.Bool("json", false, "Emit structured JSON verification report")
+	junitPath := flagSet.String("junit", "", "Write JUnit XML verification report to path")
+	if err := flagSet.Parse(args); err != nil {
+		return err
+	}
+
+	rest := flagSet.Args()
+	if len(rest) < 1 {
+		return fmt.Errorf("missing cassette path: agentfixture verify [flags] <file-or-dir>")
+	}
+	targetPath := rest[0]
+	suiteStart := time.Now()
+
+	info, statErr := os.Stat(targetPath)
+	if statErr != nil {
+		failRes := verifyFileResult{
+			Path:      filepath.ToSlash(targetPath),
+			Valid:     false,
+			ErrorType: "LoadError",
+			Error:     statErr.Error(),
+		}
+		if *junitPath != "" {
+			suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases([]verifyFileResult{failRes}), 0, 0, time.Since(suiteStart))
+			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+				return wErr
+			}
+		}
+		if *jsonOut {
+			rep := verifySummaryReport{
+				Target:          filepath.ToSlash(targetPath),
+				Mode:            "file",
+				Passed:          false,
+				TotalCassettes:  1,
+				FailedCassettes: 1,
+				Results:         []verifyFileResult{failRes},
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(rep)
+		}
+		return fmt.Errorf("failed to load cassette: %w", statErr)
+	}
+
+	if !info.IsDir() {
+		res, verifyErr := verifySingleCassetteFile(targetPath, *strictCheck)
+		rep := verifySummaryReport{
+			Target:                filepath.ToSlash(targetPath),
+			Mode:                  "file",
+			Passed:                res.Valid,
+			TotalCassettes:        1,
+			TotalInteractions:     res.Interactions,
+			TotalSSEStreams:       res.SSEStreams,
+			EstimatedTokensSaved:  res.EstimatedTokensSaved,
+			EstimatedCostSavedUSD: res.EstimatedCostSavedUSD,
+			Results:               []verifyFileResult{res},
+		}
+		if res.Valid {
+			rep.ValidCassettes = 1
+		} else {
+			rep.FailedCassettes = 1
+		}
+
+		if *junitPath != "" {
+			suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases(rep.Results), rep.EstimatedTokensSaved, rep.EstimatedCostSavedUSD, time.Since(suiteStart))
+			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+				return wErr
+			}
+		}
+
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if encErr := enc.Encode(rep); encErr != nil {
+				return encErr
+			}
+			return verifyErr
+		}
+
+		if verifyErr != nil {
+			return verifyErr
+		}
+
+		fmt.Printf("[OK] Cassette %s is VALID and SECURE\n", targetPath)
+		fmt.Printf("    Version:                %s\n", res.Version)
+		fmt.Printf("    ID:                     %s\n", res.CassetteID)
+		fmt.Printf("    Interactions:           %d (SSE streams: %d)\n", res.Interactions, res.SSEStreams)
+		fmt.Printf("    Estimated Tokens Saved: %d\n", res.EstimatedTokensSaved)
+		fmt.Printf("    Estimated Cost Saved:   $%.4f USD\n", res.EstimatedCostSavedUSD)
+		return nil
+	}
+
+	// Directory-wide batch verification
+	files, err := discoverCassetteFiles(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to scan directory %s: %w", targetPath, err)
+	}
+	if len(files) == 0 {
+		emptyErr := fmt.Errorf("no cassette files (.yaml, .yml, .json) found in directory %s", targetPath)
+		failRes := verifyFileResult{
+			Path:      filepath.ToSlash(targetPath),
+			Valid:     false,
+			ErrorType: "EmptyDirectory",
+			Error:     emptyErr.Error(),
+		}
+		if *junitPath != "" {
+			suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases([]verifyFileResult{failRes}), 0, 0, time.Since(suiteStart))
+			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+				return wErr
+			}
+		}
+		if *jsonOut {
+			rep := verifySummaryReport{
+				Target:  filepath.ToSlash(targetPath),
+				Mode:    "directory",
+				Passed:  false,
+				Results: []verifyFileResult{},
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(rep)
+		}
+		return emptyErr
+	}
+
+	rep := verifySummaryReport{
+		Target:         filepath.ToSlash(targetPath),
+		Mode:           "directory",
+		TotalCassettes: len(files),
+		Results:        make([]verifyFileResult, 0, len(files)),
+	}
+
+	for _, fPath := range files {
+		res, _ := verifySingleCassetteFile(fPath, *strictCheck)
+		if res.Valid {
+			rep.ValidCassettes++
+			rep.TotalInteractions += res.Interactions
+			rep.TotalSSEStreams += res.SSEStreams
+			rep.EstimatedTokensSaved += res.EstimatedTokensSaved
+			rep.EstimatedCostSavedUSD += res.EstimatedCostSavedUSD
+		} else {
+			rep.FailedCassettes++
+		}
+		rep.Results = append(rep.Results, res)
+	}
+	rep.Passed = rep.FailedCassettes == 0
+
+	if *junitPath != "" {
+		suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases(rep.Results), rep.EstimatedTokensSaved, rep.EstimatedCostSavedUSD, time.Since(suiteStart))
+		if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+			return wErr
+		}
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(rep); encErr != nil {
+			return encErr
+		}
+		if !rep.Passed {
+			return fmt.Errorf("batch verification failed: %d of %d cassette(s) failed", rep.FailedCassettes, rep.TotalCassettes)
+		}
+		return nil
+	}
+
+	fmt.Println("=================================================================")
+	fmt.Printf(" AgentFixture Batch Verification: %s\n", targetPath)
+	fmt.Println("=================================================================")
+	for _, r := range rep.Results {
+		if r.Valid {
+			fmt.Printf(" [OK]   %s (id=%s, interactions=%d, sse=%d, tokens=%d, saved=$%.4f)\n",
+				r.Path, r.CassetteID, r.Interactions, r.SSEStreams, r.EstimatedTokensSaved, r.EstimatedCostSavedUSD)
+		} else {
+			fmt.Printf(" [FAIL] %s: %s\n", r.Path, r.Error)
+		}
+	}
+	fmt.Println("-----------------------------------------------------------------")
+	fmt.Printf(" Total Cassettes:        %d (valid: %d, failed: %d)\n",
+		rep.TotalCassettes, rep.ValidCassettes, rep.FailedCassettes)
+	fmt.Printf(" Total Interactions:     %d (SSE streams: %d)\n",
+		rep.TotalInteractions, rep.TotalSSEStreams)
+	fmt.Printf(" Estimated Tokens Saved: %d\n", rep.EstimatedTokensSaved)
+	fmt.Printf(" Estimated Cost Saved:   $%.4f USD\n", rep.EstimatedCostSavedUSD)
+	fmt.Println("=================================================================")
+
+	if !rep.Passed {
+		return fmt.Errorf("batch verification failed: %d of %d cassette(s) failed", rep.FailedCassettes, rep.TotalCassettes)
+	}
 	return nil
 }
 
@@ -214,14 +495,11 @@ func handleInspect(args []string) error {
 			ToolName:   inter.Request.ToolName,
 			StatusCode: inter.Response.StatusCode,
 			LatencyMs:  inter.Response.LatencyMs,
-			Usage:      inter.Response.Usage,
+			Usage:      cassette.ExtractResponseUsage(&inter.Response),
 		}
 		if inter.Type == cassette.InteractionTypeSSE || len(inter.Response.SSEEvents) > 0 {
 			sum := cassette.ReconstructStreamSummary(inter.Response.SSEEvents)
 			view.StreamSummary = &sum
-			if view.Usage.InputTokens == 0 && view.Usage.OutputTokens == 0 && view.Usage.TotalTokens == 0 {
-				view.Usage = sum.Usage
-			}
 		}
 		rep.Interactions = append(rep.Interactions, view)
 	}
@@ -455,6 +733,9 @@ func diffSSEResponses(i1, i2 *cassette.Interaction) []string {
 	s2 := cassette.ReconstructStreamSummary(i2.Response.SSEEvents)
 
 	var diffs []string
+	if s1.Provider != s2.Provider && (s1.Provider != "" || s2.Provider != "") {
+		diffs = append(diffs, fmt.Sprintf("provider changed: %q -> %q", s1.Provider, s2.Provider))
+	}
 	if s1.Model != s2.Model {
 		diffs = append(diffs, fmt.Sprintf("model changed: %q -> %q", s1.Model, s2.Model))
 	}
@@ -586,6 +867,7 @@ func handleReplay(args []string) error {
 	delayScale := fs.Float64("delay-scale", 1.0, "Multiplier applied to recorded SSE delta_ms when -timing=scaled")
 	maxDelay := fs.Duration("max-delay", 2*time.Second, "Maximum per-chunk delay cap in scaled/exact SSE replay (0 for uncapped)")
 	mcpMode := fs.Bool("mcp", false, "Run deterministic MCP JSON-RPC replay over stdin/stdout")
+	junitPath := fs.String("junit", "", "Write JUnit XML regression report to path")
 
 	flagArgs, cmdArgs := splitDashArgs(args)
 	if err := fs.Parse(flagArgs); err != nil {
@@ -619,8 +901,16 @@ func handleReplay(args []string) error {
 	}
 
 	if *mcpMode {
+		start := time.Now()
 		replayer := proxy.NewStdioReplayer(cas, m)
-		return replayer.ProcessStream(os.Stdin, os.Stdout)
+		runErr := replayer.ProcessStream(os.Stdin, os.Stdout)
+		if *junitPath != "" {
+			suites := junit.BuildMCPReplaySuites(cas, *casPath, time.Since(start), runErr)
+			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+				return wErr
+			}
+		}
+		return runErr
 	}
 
 	if len(cmdArgs) > 0 {
@@ -633,6 +923,12 @@ func handleReplay(args []string) error {
 		})
 		if err != nil {
 			return err
+		}
+		if *junitPath != "" {
+			suites := junit.BuildReplaySuites(cas, *casPath, report)
+			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
+				return wErr
+			}
 		}
 		fmt.Print(report.FormatSummary())
 		if !report.Passed {

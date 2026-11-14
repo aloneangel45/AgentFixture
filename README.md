@@ -11,7 +11,7 @@
 
 > **Zero-dollar, zero-network deterministic CI/CD regression testing cassette engine for AI agents.**
 
-`AgentFixture` eliminates live LLM API bills, rate-limit flakiness, and non-deterministic model drift when testing autonomous AI coding agents (Claude Code, Cursor, Aider, OpenHands, custom MCP/HTTP agents) in Continuous Integration. Record live **Anthropic Messages API SSE streams**, **OpenAI streaming completions**, **MCP stdio tool servers**, or ingest [TracePort](https://github.com/aloneangel45/traceport) flight recordings once, then replay entire multi-turn agent suites offline in milliseconds with **$0.00 in token costs**.
+`AgentFixture` eliminates live LLM API bills, rate-limit flakiness, and non-deterministic model drift when testing autonomous AI coding agents (Claude Code, Gemini CLI, Cursor, Aider, OpenHands, custom MCP/HTTP agents) in Continuous Integration. Record live **Anthropic Messages API SSE streams**, **OpenAI streaming completions**, **Google Gemini `:streamGenerateContent?alt=sse` streams**, **MCP stdio tool servers**, or ingest [TracePort](https://github.com/aloneangel45/traceport) flight recordings once, then replay entire multi-turn agent suites offline in milliseconds with **$0.00 in token costs**.
 
 ```text
                       +-----------------------------------+
@@ -42,10 +42,10 @@
 ## Why AgentFixture?
 
 1. **Zero LLM Spend in CI**: Running a 25-test coding agent suite against Claude Sonnet or GPT-4o costs $5 to $50 per CI run ($2,250+/month across active pull requests). Replaying cassettes costs **$0.00**.
-2. **Full Anthropic & OpenAI SSE Streaming Fidelity**: Records and replays raw Server-Sent Event streams (`message_start`, `thinking_delta`, `signature_delta`, `text_delta`, `input_json_delta`, `citations_delta`, `message_delta`, `message_stop`, and OpenAI `data: [DONE]`) with `instant` (`0ms`), `scaled`, or `exact` chunk timing.
+2. **Full Anthropic, OpenAI & Google Gemini SSE Streaming Fidelity**: Records and replays raw Server-Sent Event streams (`message_start`, `thinking_delta`, `signature_delta`, `text_delta`, `input_json_delta`, `citations_delta`, OpenAI `data: [DONE]`, and Gemini `candidates` / `thought: true` / `functionCall` / `thoughtSignature` / `usageMetadata`) with `instant` (`0ms`), `scaled`, or `exact` chunk timing.
 3. **Strict Zero-Outbound-Network Enforcement**: Rejects `HTTP CONNECT` tunnels (`403 Forbidden`), locks `proxy.NewOfflineHTTPClient` strictly to loopback (`127.0.0.1`, `::1`, `localhost`), and injects offline SDK keys so tests cannot leak external traffic.
 4. **Stateful Multi-Turn & MCP Framing**: Replays identical sequential requests in turn order before idempotent fallback, and supports both NDJSON and `Content-Length` MCP stdio framing up to 16 MB.
-5. **Pre-Hash Secret Redaction**: Scrubs Anthropic, OpenAI, Google, GitHub, AWS, Slack, HuggingFace, Bearer, Cookie, URL basic-auth, and PEM credentials *before* computing SHA-256 `StrictHash` digests—eliminating secret hash oracles while allowing dummy CI keys to match seamlessly.
+5. **Pre-Hash Secret Redaction & Native CI JUnit XML**: Scrubs Anthropic, OpenAI, Google (`AIza*`, `x-goog-api-key`), GitHub, AWS, Slack, HuggingFace, Bearer, Cookie, URL basic-auth, and PEM credentials *before* computing SHA-256 `StrictHash` digests, and emits standard JUnit XML (`-junit`) for native GitHub Actions, GitLab CI, and CircleCI annotations.
 
 ---
 
@@ -53,7 +53,7 @@
 
 ```text
 +-------------------------------------------------------------------------------+
-|                           AgentFixture v1.1 Engine                            |
+|                           AgentFixture v1.2 Engine                            |
 +-------------------------------------------------------------------------------+
 |                                                                               |
 |  +-------------------------------------------------------------------------+  |
@@ -88,6 +88,20 @@
 
 ## Installation
 
+### One-Line Verified Installers (Recommended)
+
+Both installers automatically detect your OS and CPU architecture (`amd64`/`arm64`) and enforce mandatory SHA-256 verification against `checksums.txt` before extracting the binary:
+
+```bash
+# Linux & macOS (amd64 / arm64)
+curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell (amd64 / arm64)
+irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
+```
+
 ### Pre-Compiled Binaries
 
 Download pre-compiled binaries for Linux (`amd64`/`arm64`), macOS (`amd64`/`arm64`), and Windows (`amd64`/`arm64`) from [Releases](https://github.com/aloneangel45/AgentFixture/releases).
@@ -112,10 +126,14 @@ go install github.com/aloneangel45/AgentFixture/cmd/agentfixture@latest
 
 ## CLI Quick Start
 
-### 1. Record Live Anthropic / OpenAI SSE Streaming Sessions
+### 1. Record Live Anthropic, OpenAI, or Google Gemini SSE Streaming Sessions
 
 ```bash
+# Anthropic Claude Messages API
 agentfixture record -cassette fixtures/claude_stream.yaml -upstream https://api.anthropic.com -- python run_agent.py
+
+# Google Gemini API (:streamGenerateContent?alt=sse & :generateContent)
+agentfixture record -cassette fixtures/gemini_stream.yaml -upstream https://generativelanguage.googleapis.com -- python gemini_agent.py
 ```
 
 Record an MCP stdio tool server directly:
@@ -124,10 +142,10 @@ Record an MCP stdio tool server directly:
 agentfixture record -mcp -cassette fixtures/mcp_fs.yaml -- npx -y @modelcontextprotocol/server-filesystem .
 ```
 
-### 2. Replay Deterministically in CI (`0ms` Instant SSE Mode)
+### 2. Replay Deterministically in CI (`0ms` Instant SSE Mode + JUnit XML)
 
 ```bash
-agentfixture replay -cassette fixtures/claude_stream.yaml -timing instant -- go test -v ./...
+agentfixture replay -cassette fixtures/claude_stream.yaml -timing instant -junit reports/replay.xml -- go test -v ./...
 ```
 
 Output:
@@ -150,20 +168,32 @@ Simulate realistic token arrival pacing (`scaled` or `exact`):
 agentfixture replay -cassette fixtures/claude_stream.yaml -timing scaled -delay-scale 0.25 -max-delay 250ms -- python ui_test.py
 ```
 
-### 3. Verify Schema & Secret Redaction
+### 3. Batch-Verify Directories, JSON Telemetry & JUnit XML
+
+Validate a single cassette or recursively scan an entire directory tree (`.yaml`, `.yml`, `.json`) in deterministic sorted order:
 
 ```bash
+# Single file verification
 agentfixture verify fixtures/claude_stream.yaml
+
+# Recursive directory batch verification with CI JUnit XML & JSON output
+agentfixture verify -junit reports/verify.xml fixtures/
+agentfixture verify -json fixtures/
 ```
 
 Output:
 ```text
-[OK] Cassette fixtures/claude_stream.yaml is VALID and SECURE
-    Version:                agentfixture/v1
-    ID:                     cas_record_1794339000
-    Interactions:           8 (SSE streams: 5)
-    Estimated Tokens Saved: 24150
-    Estimated Cost Saved:   $0.1449 USD
+=================================================================
+ AgentFixture Batch Verification: fixtures/
+=================================================================
+ [OK]   fixtures/claude_stream.yaml (id=cas_record_1794339000, interactions=8, sse=5, tokens=24150, saved=$0.1449)
+ [OK]   fixtures/gemini_stream.yaml (id=cas_record_1794339200, interactions=4, sse=4, tokens=11820, saved=$0.0712)
+-----------------------------------------------------------------
+ Total Cassettes:        2 (valid: 2, failed: 0)
+ Total Interactions:     12 (SSE streams: 9)
+ Estimated Tokens Saved: 35970
+ Estimated Cost Saved:   $0.2161 USD
+=================================================================
 ```
 
 ### 4. Inspect Reconstructed SSE Streams & Telemetry
@@ -247,7 +277,7 @@ version: "agentfixture/v1"
 metadata:
   cassette_id: "cas_anthropic_sse_01"
   recorded_at: "2026-11-10T16:40:00Z"
-  generator: "AgentFixture v1.1.0"
+  generator: "AgentFixture v1.2.0"
   model: "claude-sonnet-4-20250514"
   metrics:
     total_interactions: 1
@@ -321,11 +351,16 @@ jobs:
         with:
           go-version: '1.23'
       - name: Install AgentFixture
-        run: go install github.com/aloneangel45/AgentFixture/cmd/agentfixture@latest
-      - name: Verify Cassettes Are Leak-Free
-        run: agentfixture verify fixtures/agent_suite.yaml
+        run: curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
+      - name: Batch-Verify All Cassettes Are Leak-Free
+        run: agentfixture verify -junit reports/verify-junit.xml fixtures/
       - name: Run Zero-Dollar Offline Agent Regression Suite
-        run: agentfixture replay -cassette fixtures/agent_suite.yaml -timing instant -- go test -v ./...
+        run: agentfixture replay -cassette fixtures/agent_suite.yaml -timing instant -junit reports/replay-junit.xml -- go test -v ./...
+      - name: Publish JUnit Annotations
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: 'reports/*-junit.xml'
 ```
 
 ---

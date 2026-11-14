@@ -322,3 +322,97 @@ func TestSSE_CassetteSerializationRedactionAndMetrics(t *testing.T) {
 		t.Errorf("expected positive cost saved USD, got %f", loaded.Metadata.Metrics.EstimatedCostSavedUSD)
 	}
 }
+
+func TestSSE_GoogleGeminiStreamReconstructionAndMetrics(t *testing.T) {
+	geminiSSE := strings.Join([]string{
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"First, inspect ","thought":true}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_gem_001"}`,
+		"",
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"the SSE parser.","thought":true}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_gem_001"}`,
+		"",
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I will read ","thoughtSignature":"sig_gem_part_1"}]},"index":0}],"modelVersion":"gemini-2.5-pro","responseId":"resp_gem_001"}`,
+		"",
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"pkg/cassette/sse.go."},{"functionCall":{"id":"fc_gem_01","name":"read_file","args":{"path":"pkg/cassette/sse.go","limit":9007199254740993}},"thoughtSignature":"sig_gem_part_2"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":300,"candidatesTokenCount":60,"thoughtsTokenCount":40,"cachedContentTokenCount":50,"totalTokenCount":400},"modelVersion":"gemini-2.5-pro","responseId":"resp_gem_001"}`,
+		"",
+	}, "\r\n")
+
+	events, err := DecodeSSE(strings.NewReader(geminiSSE))
+	if err != nil {
+		t.Fatalf("DecodeSSE failed on Gemini SSE stream: %v", err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("expected 4 Gemini SSE events, got %d", len(events))
+	}
+
+	summary := ReconstructStreamSummary(events)
+	if summary.Provider != "gemini" {
+		t.Errorf("expected provider 'gemini', got %q", summary.Provider)
+	}
+	if summary.Model != "gemini-2.5-pro" {
+		t.Errorf("expected model 'gemini-2.5-pro', got %q", summary.Model)
+	}
+	if summary.MessageID != "resp_gem_001" {
+		t.Errorf("expected message_id 'resp_gem_001', got %q", summary.MessageID)
+	}
+	if summary.Role != "model" {
+		t.Errorf("expected role 'model', got %q", summary.Role)
+	}
+	if summary.Text != "I will read pkg/cassette/sse.go." {
+		t.Errorf("unexpected Gemini text: %q", summary.Text)
+	}
+	if len(summary.ThinkingBlocks) != 1 || summary.ThinkingBlocks[0] != "First, inspect the SSE parser." {
+		t.Errorf("unexpected Gemini thinking blocks: %+v", summary.ThinkingBlocks)
+	}
+	if len(summary.Signatures) != 2 || summary.Signatures[0] != "sig_gem_part_1" || summary.Signatures[1] != "sig_gem_part_2" {
+		t.Errorf("unexpected Gemini signatures: %+v", summary.Signatures)
+	}
+	if len(summary.ToolCalls) != 1 {
+		t.Fatalf("expected 1 Gemini functionCall, got %d", len(summary.ToolCalls))
+	}
+	fc := summary.ToolCalls[0]
+	if fc.ID != "fc_gem_01" || fc.Name != "read_file" {
+		t.Errorf("unexpected Gemini functionCall metadata: %+v", fc)
+	}
+	if fc.Input["path"] != "pkg/cassette/sse.go" || fc.Input["limit"] != int64(9007199254740993) {
+		t.Errorf("unexpected Gemini functionCall args: %+v", fc.Input)
+	}
+	if summary.StopReason != "STOP" {
+		t.Errorf("expected stop_reason 'STOP', got %q", summary.StopReason)
+	}
+	// OutputTokens = candidatesTokenCount (60) + thoughtsTokenCount (40) = 100
+	if summary.Usage.InputTokens != 300 || summary.Usage.OutputTokens != 100 ||
+		summary.Usage.CacheReadInputTokens != 50 || summary.Usage.TotalTokens != 400 {
+		t.Errorf("unexpected Gemini usage: %+v", summary.Usage)
+	}
+
+	// Verify ComputeMetrics on BOTH streaming Gemini SSE and non-streaming Gemini JSON responses
+	cas := NewCassette("cas_gemini_metrics")
+	cas.Interactions = []Interaction{
+		{
+			ID:       "gem_sse_1",
+			Sequence: 1,
+			Type:     InteractionTypeSSE,
+			Request:  Request{Method: "POST", Endpoint: "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"},
+			Response: Response{StatusCode: 200, LatencyMs: 120, SSEEvents: events},
+		},
+		{
+			ID:       "gem_http_2",
+			Sequence: 2,
+			Type:     InteractionTypeHTTP,
+			Request:  Request{Method: "POST", Endpoint: "/v1beta/models/gemini-2.5-flash:generateContent"},
+			Response: Response{
+				StatusCode: 200,
+				LatencyMs:  80,
+				RawBody:    `{"candidates":[{"content":{"role":"model","parts":[{"text":"Non-streaming reply"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":150,"candidatesTokenCount":30,"thoughtsTokenCount":20,"totalTokenCount":200},"modelVersion":"gemini-2.5-flash"}`,
+			},
+		},
+	}
+
+	cas.ComputeMetrics()
+	// Total tokens = 400 (SSE) + 200 (HTTP) = 600
+	if cas.Metadata.Metrics.EstimatedTokensSaved != 600 {
+		t.Errorf("expected 600 total Gemini tokens saved, got %d", cas.Metadata.Metrics.EstimatedTokensSaved)
+	}
+	if cas.Metadata.Metrics.EstimatedCostSavedUSD <= 0 {
+		t.Errorf("expected positive Gemini cost saved USD, got %f", cas.Metadata.Metrics.EstimatedCostSavedUSD)
+	}
+}

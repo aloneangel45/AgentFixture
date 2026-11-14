@@ -210,7 +210,7 @@ func (sr *StdioReplayer) synthesizeProtocolResponse(method string) (interface{},
 			},
 			"serverInfo": map[string]interface{}{
 				"name":    "AgentFixture-MCP-Replay",
-				"version": "1.1.0",
+				"version": "1.2.0",
 			},
 		}, true
 	case "tools/list":

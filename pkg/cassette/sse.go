@@ -90,7 +90,7 @@ type ToolUseSummary struct {
 	ParseErr string                 `json:"parse_error,omitempty" yaml:"parse_error,omitempty"`
 }
 
-// StreamSummary aggregates the semantic result of an Anthropic or OpenAI SSE stream.
+// StreamSummary aggregates the semantic result of an Anthropic, OpenAI, or Google Gemini SSE stream.
 type StreamSummary struct {
 	Provider       string           `json:"provider,omitempty" yaml:"provider,omitempty"`
 	MessageID      string           `json:"message_id,omitempty" yaml:"message_id,omitempty"`
@@ -399,9 +399,10 @@ type openAIToolAcc struct {
 	argsBuf strings.Builder
 }
 
-// ReconstructStreamSummary reassembles an Anthropic Messages API or OpenAI-compatible SSE
-// stream into a complete structured StreamSummary (assistant text, extended thinking blocks,
-// signatures, citations, concatenated & parsed tool_use JSON inputs, stop_reason, and Usage).
+// ReconstructStreamSummary reassembles an Anthropic Messages API, OpenAI-compatible, or
+// Google Gemini (:streamGenerateContent?alt=sse) SSE stream into a complete structured
+// StreamSummary (assistant/model text, thinking/thought blocks, signatures, citations,
+// tool/function calls, stop/finish reason, and Usage).
 func ReconstructStreamSummary(events []SSEEvent) StreamSummary {
 	summary := StreamSummary{
 		EventCount: len(events),
@@ -416,6 +417,25 @@ func ReconstructStreamSummary(events []SSEEvent) StreamSummary {
 
 	openAITools := make(map[int]*openAIToolAcc)
 	var openAIToolOrder []int
+
+	var (
+		geminiThoughtBuf    strings.Builder
+		hasGeminiThought    bool
+		geminiToolIndex     int
+		geminiCandTokens    int
+		geminiThoughtTokens int
+	)
+
+	flushGeminiThought := func() {
+		if !hasGeminiThought {
+			return
+		}
+		if geminiThoughtBuf.Len() > 0 {
+			summary.ThinkingBlocks = append(summary.ThinkingBlocks, geminiThoughtBuf.String())
+		}
+		geminiThoughtBuf.Reset()
+		hasGeminiThought = false
+	}
 
 	getOrCreateBlock := func(idx int) *activeAnthropicBlock {
 		b, exists := blocks[idx]
@@ -694,6 +714,82 @@ func ReconstructStreamSummary(events []SSEEvent) StreamSummary {
 			if uMap, ok := rawMap["usage"].(map[string]interface{}); ok {
 				mergeOpenAIOrAnthropicUsage(&summary.Usage, uMap)
 			}
+
+			// Check Google Gemini (:streamGenerateContent?alt=sse) streaming chunks
+			_, hasCandidates := rawMap["candidates"]
+			_, hasUsageMeta := rawMap["usageMetadata"]
+			_, hasModelVer := rawMap["modelVersion"]
+			if hasCandidates || hasUsageMeta || hasModelVer {
+				summary.Provider = "gemini"
+				if summary.Role == "" {
+					summary.Role = "model"
+				}
+				if mv, ok := rawMap["modelVersion"].(string); ok && mv != "" {
+					summary.Model = mv
+				}
+				if rid, ok := rawMap["responseId"].(string); ok && rid != "" {
+					summary.MessageID = rid
+				}
+				if cands, ok := rawMap["candidates"].([]interface{}); ok && len(cands) > 0 {
+					if cand, ok := cands[0].(map[string]interface{}); ok {
+						if fr, ok := cand["finishReason"].(string); ok && fr != "" {
+							summary.StopReason = fr
+						}
+						if content, ok := cand["content"].(map[string]interface{}); ok {
+							if role, ok := content["role"].(string); ok && role != "" {
+								summary.Role = role
+							}
+							if parts, ok := content["parts"].([]interface{}); ok {
+								for _, partItem := range parts {
+									part, ok := partItem.(map[string]interface{})
+									if !ok {
+										continue
+									}
+									isThought, _ := part["thought"].(bool)
+									if isThought {
+										if txt, ok := part["text"].(string); ok && txt != "" {
+											geminiThoughtBuf.WriteString(txt)
+											hasGeminiThought = true
+										}
+									} else {
+										if txt, ok := part["text"].(string); ok {
+											flushGeminiThought()
+											fullText.WriteString(txt)
+										}
+									}
+									if fc, ok := part["functionCall"].(map[string]interface{}); ok {
+										flushGeminiThought()
+										tc := extractGeminiFunctionCall(geminiToolIndex, fc)
+										geminiToolIndex++
+										summary.ToolCalls = append(summary.ToolCalls, tc)
+									}
+									if sig, ok := part["thoughtSignature"].(string); ok && sig != "" {
+										summary.Signatures = append(summary.Signatures, sig)
+									}
+								}
+							}
+						}
+					}
+				}
+				if uMeta, ok := rawMap["usageMetadata"].(map[string]interface{}); ok {
+					mergeGeminiUsage(&summary.Usage, uMeta, &geminiCandTokens, &geminiThoughtTokens)
+				}
+			}
+
+			if errObj, ok := rawMap["error"].(map[string]interface{}); ok && summary.ErrorMessage == "" {
+				msg, _ := errObj["message"].(string)
+				errType, _ := errObj["type"].(string)
+				if errType == "" {
+					errType, _ = errObj["status"].(string)
+				}
+				if errType != "" && msg != "" {
+					summary.ErrorMessage = errType + ": " + msg
+				} else if msg != "" {
+					summary.ErrorMessage = msg
+				} else {
+					summary.ErrorMessage = errType
+				}
+			}
 		}
 	}
 
@@ -702,6 +798,9 @@ func ReconstructStreamSummary(events []SSEEvent) StreamSummary {
 	for _, idx := range blockOrder {
 		finalizeBlock(blocks[idx])
 	}
+
+	// Finalize any trailing Google Gemini thought block
+	flushGeminiThought()
 
 	// Finalize any OpenAI streamed tool calls
 	sort.Ints(openAIToolOrder)
@@ -729,6 +828,71 @@ func ReconstructStreamSummary(events []SSEEvent) StreamSummary {
 
 	summary.Text = fullText.String()
 	return summary
+}
+
+func extractGeminiFunctionCall(idx int, fc map[string]interface{}) ToolUseSummary {
+	name, _ := fc["name"].(string)
+	id, _ := fc["id"].(string)
+	tc := ToolUseSummary{
+		Index: idx,
+		ID:    id,
+		Name:  name,
+	}
+	switch args := fc["args"].(type) {
+	case map[string]interface{}:
+		tc.Input = args
+		if b, err := json.Marshal(args); err == nil {
+			tc.RawInput = string(b)
+		}
+	case string:
+		trimmed := strings.TrimSpace(args)
+		tc.RawInput = trimmed
+		if trimmed != "" {
+			if parsed, err := decodeJSONMapUseNumber([]byte(trimmed)); err == nil {
+				tc.Input = parsed
+			} else {
+				tc.ParseErr = err.Error()
+			}
+		} else {
+			tc.Input = map[string]interface{}{}
+		}
+	default:
+		tc.Input = map[string]interface{}{}
+	}
+	return tc
+}
+
+func mergeGeminiUsage(dst *Usage, uMeta map[string]interface{}, candTokens *int, thoughtTokens *int) {
+	if v, ok := uMeta["promptTokenCount"]; ok {
+		if n := asInt(v); n > 0 || dst.InputTokens == 0 {
+			dst.InputTokens = n
+		}
+	}
+	updatedOut := false
+	if v, ok := uMeta["candidatesTokenCount"]; ok {
+		*candTokens = asInt(v)
+		updatedOut = true
+	}
+	if v, ok := uMeta["thoughtsTokenCount"]; ok {
+		*thoughtTokens = asInt(v)
+		updatedOut = true
+	}
+	if updatedOut {
+		out := *candTokens + *thoughtTokens
+		if out > 0 || dst.OutputTokens == 0 {
+			dst.OutputTokens = out
+		}
+	}
+	if v, ok := uMeta["cachedContentTokenCount"]; ok {
+		if n := asInt(v); n > 0 || dst.CacheReadInputTokens == 0 {
+			dst.CacheReadInputTokens = n
+		}
+	}
+	if v, ok := uMeta["totalTokenCount"]; ok {
+		if n := asInt(v); n > 0 || dst.TotalTokens == 0 {
+			dst.TotalTokens = n
+		}
+	}
 }
 
 func mergeAnthropicUsage(dst *Usage, uMap map[string]interface{}) {
@@ -770,7 +934,8 @@ func mergeOpenAIOrAnthropicUsage(dst *Usage, uMap map[string]interface{}) {
 	}
 }
 
-// ExtractUsageFromBody extracts provider Usage statistics from a decoded JSON response body map.
+// ExtractUsageFromBody extracts Anthropic, OpenAI, or Google Gemini Usage statistics
+// from a decoded JSON response body map.
 func ExtractUsageFromBody(body interface{}) Usage {
 	var u Usage
 	m, ok := body.(map[string]interface{})
@@ -780,7 +945,56 @@ func ExtractUsageFromBody(body interface{}) Usage {
 	if uMap, ok := m["usage"].(map[string]interface{}); ok {
 		mergeOpenAIOrAnthropicUsage(&u, uMap)
 	}
+	if uMeta, ok := m["usageMetadata"].(map[string]interface{}); ok {
+		var cand, thoughts int
+		mergeGeminiUsage(&u, uMeta, &cand, &thoughts)
+	}
 	return u
+}
+
+// ExtractModelFromBody extracts the provider model identifier ("model" or Gemini "modelVersion")
+// from a decoded JSON response body map.
+func ExtractModelFromBody(body interface{}) string {
+	m, ok := body.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	if model, ok := m["model"].(string); ok && model != "" {
+		return model
+	}
+	if mv, ok := m["modelVersion"].(string); ok && mv != "" {
+		return mv
+	}
+	return ""
+}
+
+// ExtractResponseUsage returns recorded Usage or reconstructs it from SSEEvents,
+// structured JSON Body, or JSON RawBody (Anthropic, OpenAI, and Google Gemini).
+func ExtractResponseUsage(resp *Response) Usage {
+	if resp == nil {
+		return Usage{}
+	}
+	if !resp.Usage.IsZero() {
+		return resp.Usage
+	}
+	if len(resp.SSEEvents) > 0 {
+		if u := ReconstructStreamSummary(resp.SSEEvents).Usage; !u.IsZero() {
+			return u
+		}
+	}
+	if resp.Body != nil {
+		if u := ExtractUsageFromBody(resp.Body); !u.IsZero() {
+			return u
+		}
+	}
+	if raw := strings.TrimSpace(resp.RawBody); len(raw) > 0 && raw[0] == '{' {
+		if parsed, err := decodeJSONMapUseNumber([]byte(raw)); err == nil {
+			if u := ExtractUsageFromBody(parsed); !u.IsZero() {
+				return u
+			}
+		}
+	}
+	return Usage{}
 }
 
 func decodeJSONMapUseNumber(data []byte) (map[string]interface{}, error) {

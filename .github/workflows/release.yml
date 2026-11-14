@@ -31,7 +31,7 @@ jobs:
       - name: Build Multi-Platform Binaries
         run: |
           mkdir -p dist
-          VERSION=${GITHUB_REF_NAME:-v1.1.0}
+          VERSION=${GITHUB_REF_NAME:-v1.2.0}
 
           # Windows amd64
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture.exe ./cmd/agentfixture

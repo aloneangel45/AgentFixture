@@ -5,6 +5,14 @@ All notable changes to **AgentFixture** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-14
+
+### Added
+- **First-Class Google Gemini API SSE Streaming & Token/Cost Accounting (`pkg/cassette/sse.go`, `pkg/cassette/types.go`, `pkg/proxy`)**: Extended `ReconstructStreamSummary` to natively detect and reconstruct Google Gemini `:streamGenerateContent?alt=sse` streams (`candidates`, `modelVersion`, `responseId`, `thought: true` reasoning blocks, `text` deltas, `functionCall` tool invocations, `thoughtSignature` signatures, `finishReason`, and `usageMetadata`). Extended `ExtractUsageFromBody`, `ExtractResponseUsage`, and `ComputeMetrics()` so both streaming and non-streaming Gemini responses (`promptTokenCount`, `candidatesTokenCount` + `thoughtsTokenCount`, `cachedContentTokenCount`, `totalTokenCount`) accurately populate `EstimatedTokensSaved` and `EstimatedCostSavedUSD`, with full `agentfixture diff` semantic SSE support and offline Gemini SDK environment defaults in `runner.Run`.
+- **Directory-Wide Batch Verification (`cmd/agentfixture`)**: Upgraded `agentfixture verify [flags] <file-or-dir>` to recursively discover `.yaml`, `.yml`, and `.json` cassettes in deterministic sorted order, validate schema compliance and scan for unredacted secrets across every cassette, report per-cassette status plus aggregate interaction/SSE/token/USD totals, emit machine-readable JSON reports via `-json`, and exit non-zero if any cassette fails.
+- **Native CI/CD JUnit XML Reporting (`pkg/junit`, `cmd/agentfixture`)**: Added `pkg/junit` (`encoding/xml` with XML 1.0 control-character sanitization) and `-junit <report.xml>` flags to both `agentfixture verify` and `agentfixture replay`, emitting standard `<testsuites>`, `<testsuite>`, `<testcase>`, `<failure>`, and `<skipped>` reports for native test annotations in GitHub Actions, GitLab CI, and CircleCI.
+- **Universal One-Line Installers (`install.sh`, `install.ps1`)**: Added POSIX/bash (`install.sh` for Linux & macOS `amd64`/`arm64`) and PowerShell (`install.ps1` for Windows `amd64`/`arm64`) installers with mandatory SHA-256 verification against GitHub Release `checksums.txt` prior to extraction.
+
 ## [1.1.0] - 2026-11-10
 
 ### Added

@@ -531,6 +531,9 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 
 		summary := cassette.ReconstructStreamSummary(events)
 		meta := make(map[string]string)
+		if summary.Provider != "" {
+			meta["provider"] = summary.Provider
+		}
 		if summary.Model != "" {
 			meta["model"] = summary.Model
 		}
@@ -583,10 +586,12 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 
 	var respJSON interface{}
 	var usage cassette.Usage
+	var detectedModel string
 	if strings.Contains(contentType, "json") && len(respBody) > 0 {
 		if parsed, decErr := matcher.DecodeJSONUseNumber(respBody); decErr == nil {
 			respJSON = parsed
 			usage = cassette.ExtractUsageFromBody(parsed)
+			detectedModel = cassette.ExtractModelFromBody(parsed)
 		}
 	}
 
@@ -612,6 +617,9 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 	seq := len(s.cassette.Interactions) + 1
 	inter.ID = fmt.Sprintf("int_%03d", seq)
 	inter.Sequence = seq
+	if s.cassette.Metadata.Model == "" && detectedModel != "" {
+		s.cassette.Metadata.Model = detectedModel
+	}
 	s.cassette.Interactions = append(s.cassette.Interactions, inter)
 	s.mu.Unlock()
 

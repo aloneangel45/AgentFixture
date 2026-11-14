@@ -34,4 +34,4 @@ jobs:
         run: go test -bench=Benchmark -benchmem -benchtime=100ms -run=NONE ./pkg/cassette ./pkg/matcher
 
       - name: Compile CLI Binary
-        run: go build -v -ldflags="-s -w -X main.Version=v1.1.0" ./cmd/agentfixture
+        run: go build -v -ldflags="-s -w -X main.Version=v1.2.0" ./cmd/agentfixture

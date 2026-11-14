@@ -159,6 +159,8 @@ func Run(opts RunOptions) (*TestReport, error) {
 		"AGENTFIXTURE_PROXY_URL": proxyURL,
 		"ANTHROPIC_BASE_URL":     proxyURL,
 		"OPENAI_BASE_URL":        proxyURL,
+		"GOOGLE_GEMINI_BASE_URL": proxyURL,
+		"GEMINI_BASE_URL":        proxyURL,
 		"HTTP_PROXY":             proxyURL,
 		"NO_PROXY":               "127.0.0.1,localhost,::1",
 	}
@@ -176,6 +178,8 @@ func Run(opts RunOptions) (*TestReport, error) {
 		fallbacks = map[string]string{
 			"ANTHROPIC_API_KEY": "af-replay-offline-key",
 			"OPENAI_API_KEY":    "af-replay-offline-key",
+			"GEMINI_API_KEY":    "AIzaSyAgentFixtureOfflineReplayKey00000",
+			"GOOGLE_API_KEY":    "AIzaSyAgentFixtureOfflineReplayKey00000",
 		}
 	}
 

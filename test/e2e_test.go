@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,4 +226,108 @@ type proxyMockServer struct {
 
 func (p *proxyMockServer) Close() {
 	_ = p.server.Close()
+}
+
+func TestEndToEnd_GeminiSSERecordReplayAndMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		chunks := []string{
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Analyzing repo...\",\"thought\":true}]}}],\"modelVersion\":\"gemini-2.5-pro\",\"responseId\":\"gem_e2e_1\"}\r\n\r\n",
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Running tool.\"},{\"functionCall\":{\"id\":\"call_gem_1\",\"name\":\"list_files\",\"args\":{\"dir\":\"pkg\"}}},{\"thoughtSignature\":\"sig_gem_e2e\"}]}}],\"modelVersion\":\"gemini-2.5-pro\",\"responseId\":\"gem_e2e_1\"}\r\n\r\n",
+			"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":220,\"candidatesTokenCount\":35,\"thoughtsTokenCount\":25,\"cachedContentTokenCount\":40,\"totalTokenCount\":280},\"modelVersion\":\"gemini-2.5-pro\",\"responseId\":\"gem_e2e_1\"}\r\n\r\n",
+		}
+		for _, ch := range chunks {
+			_, _ = w.Write([]byte(ch))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+
+	casPath := filepath.Join(t.TempDir(), "gemini_e2e.yaml")
+	recordSrv, err := proxy.NewServer(proxy.Config{
+		Mode:        proxy.ModeRecord,
+		UpstreamURL: upstream.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordSrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	reqBody := `{"contents":[{"role":"user","parts":[{"text":"List files in pkg"}]}]}`
+	recReq, _ := http.NewRequest("POST", recordSrv.URL()+"/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe", strings.NewReader(reqBody))
+	recReq.Header.Set("Content-Type", "application/json")
+	recReq.Header.Set("x-goog-api-key", "AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe")
+
+	recResp, err := http.DefaultClient.Do(recReq)
+	if err != nil {
+		t.Fatalf("Gemini record request failed: %v", err)
+	}
+	_, _ = io.ReadAll(recResp.Body)
+	_ = recResp.Body.Close()
+
+	if err := cassette.Save(casPath, recordSrv.GetCassette()); err != nil {
+		t.Fatalf("failed saving Gemini cassette: %v", err)
+	}
+	_ = recordSrv.Close()
+	upstream.Close()
+
+	loaded, err := cassette.Load(casPath)
+	if err != nil {
+		t.Fatalf("failed loading Gemini cassette: %v", err)
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(loaded); hasSec {
+		t.Fatalf("expected Google API keys in header & URL query to be redacted, got: %s", reason)
+	}
+	if loaded.Metadata.Model != "gemini-2.5-pro" {
+		t.Errorf("expected cassette metadata model 'gemini-2.5-pro', got %q", loaded.Metadata.Model)
+	}
+	if loaded.Metadata.Metrics.EstimatedTokensSaved != 280 {
+		t.Errorf("expected 280 Gemini tokens saved, got %d", loaded.Metadata.Metrics.EstimatedTokensSaved)
+	}
+
+	replaySrv, err := proxy.NewServer(proxy.Config{
+		Mode:      proxy.ModeReplay,
+		Cassette:  loaded,
+		Matcher:   matcher.NewStrictMatcher(),
+		SSETiming: cassette.SSETimingConfig{Mode: cassette.SSETimingInstant},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaySrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer replaySrv.Close()
+
+	offlineClient := proxy.NewOfflineHTTPClient(replaySrv.URL())
+	repReq, _ := http.NewRequest("POST", replaySrv.URL()+"/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=AIzaSyAgentFixtureOfflineReplayKey00000", strings.NewReader(reqBody))
+	repReq.Header.Set("Content-Type", "application/json")
+	repReq.Header.Set("x-goog-api-key", "AIzaSyAgentFixtureOfflineReplayKey00000")
+
+	repResp, err := offlineClient.Do(repReq)
+	if err != nil {
+		t.Fatalf("Gemini offline replay failed: %v", err)
+	}
+	defer repResp.Body.Close()
+	if repResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on Gemini replay, got %d", repResp.StatusCode)
+	}
+
+	events, err := cassette.DecodeSSE(repResp.Body)
+	if err != nil {
+		t.Fatalf("DecodeSSE failed: %v", err)
+	}
+	summary := cassette.ReconstructStreamSummary(events)
+	if summary.Provider != "gemini" || summary.StopReason != "STOP" || len(summary.ToolCalls) != 1 || summary.ToolCalls[0].Name != "list_files" {
+		t.Fatalf("unexpected replayed Gemini StreamSummary: %+v", summary)
+	}
+	if summary.Usage.InputTokens != 220 || summary.Usage.OutputTokens != 60 || summary.Usage.CacheReadInputTokens != 40 || summary.Usage.TotalTokens != 280 {
+		t.Fatalf("unexpected replayed Gemini usage: %+v", summary.Usage)
+	}
 }
