@@ -90,9 +90,13 @@ type VerifyCaseInput struct {
 	Error                 string
 }
 
+func normalizeSlashPath(p string) string {
+	return strings.ReplaceAll(filepath.ToSlash(p), "\\", "/")
+}
+
 // BuildVerifySuites constructs a standard JUnit XML report from single-file or batch cassette verification results.
 func BuildVerifySuites(target string, cases []VerifyCaseInput, totalTokens int64, totalCostUSD float64, totalDuration time.Duration) TestSuites {
-	normTarget := filepath.ToSlash(target)
+	normTarget := normalizeSlashPath(target)
 	suite := TestSuite{
 		Name:      "agentfixture.verify",
 		Time:      formatSeconds(totalDuration),
@@ -108,7 +112,7 @@ func BuildVerifySuites(target string, cases []VerifyCaseInput, totalTokens int64
 	}
 
 	for _, c := range cases {
-		normPath := sanitizeXMLText(filepath.ToSlash(c.Path))
+		normPath := sanitizeXMLText(normalizeSlashPath(c.Path))
 		tc := TestCase{
 			Name:      normPath,
 			ClassName: "agentfixture.verify",
@@ -150,7 +154,7 @@ func BuildVerifySuites(target string, cases []VerifyCaseInput, totalTokens int64
 
 // BuildReplaySuites constructs a standard JUnit XML report from a runner.TestReport and its Cassette.
 func BuildReplaySuites(cas *cassette.Cassette, casPath string, rep *runner.TestReport) TestSuites {
-	normPath := sanitizeXMLText(filepath.ToSlash(casPath))
+	normPath := sanitizeXMLText(normalizeSlashPath(casPath))
 	casID := "unknown"
 	if rep != nil && rep.CassetteID != "" {
 		casID = rep.CassetteID
@@ -305,7 +309,7 @@ func BuildReplaySuites(cas *cassette.Cassette, casPath string, rep *runner.TestR
 
 // BuildMCPReplaySuites constructs a JUnit XML report for MCP stdio replay sessions.
 func BuildMCPReplaySuites(cas *cassette.Cassette, casPath string, duration time.Duration, replayErr error) TestSuites {
-	normPath := sanitizeXMLText(filepath.ToSlash(casPath))
+	normPath := sanitizeXMLText(normalizeSlashPath(casPath))
 	casID := "mcp_stdio"
 	if cas != nil && cas.Metadata.CassetteID != "" {
 		casID = cas.Metadata.CassetteID
