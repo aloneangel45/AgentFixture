@@ -56,13 +56,11 @@ func FromJSON(data []byte) (*Cassette, error) {
 	return &c, nil
 }
 
-// Save writes a Cassette to disk, automatically selecting YAML or JSON based on file extension.
+// Save writes a Cassette atomically to disk via a temporary file + fsync + rename,
+// automatically selecting YAML or JSON based on file extension.
 func Save(path string, c *Cassette) error {
-	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("cassette path cannot be empty")
 	}
 
 	ext := strings.ToLower(filepath.Ext(path))
@@ -78,7 +76,56 @@ func Save(path string, c *Cassette) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return writeFileAtomic(path, data, 0644)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	tmpFile, err := os.CreateTemp(dir, ".agentfixture-tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file in %s: %w", dir, err)
+	}
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to write temporary cassette file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync temporary cassette file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary cassette file: %w", err)
+	}
+	_ = os.Chmod(tmpPath, perm)
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		if remErr := os.Remove(path); remErr == nil {
+			if renErr := os.Rename(tmpPath, path); renErr == nil {
+				committed = true
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to atomically write cassette %s: %w", path, err)
+	}
+	committed = true
+	return nil
 }
 
 // Load reads a Cassette from disk, determining format by file extension.

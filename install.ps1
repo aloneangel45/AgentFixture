@@ -1,10 +1,10 @@
 # AgentFixture Universal PowerShell One-Line Installer (Windows amd64/arm64)
 # Usage:
 #   irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
-#   $env:AGENTFIXTURE_VERSION = "v1.2.0"; irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
+#   $env:AGENTFIXTURE_VERSION = "v1.2.1"; irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 function Write-AFInfo {
     param([string]$Message)
@@ -149,7 +149,14 @@ try {
             [Environment]::SetEnvironmentVariable('Path', $UpdatedPath, 'User')
             Write-AFInfo "Added $InstallDir to User PATH."
         }
-        if (($env:Path -split ';') -notcontains $InstallDir) {
+        $InProcessPath = $false
+        foreach ($procEntry in ($env:Path -split ';')) {
+            if ($procEntry.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')) {
+                $InProcessPath = $true
+                break
+            }
+        }
+        if (-not $InProcessPath) {
             $env:Path = "$InstallDir;$env:Path"
         }
     }

@@ -261,7 +261,8 @@ func EncodeSSEStream(events []SSEEvent) []byte {
 func encodeSSEEventInto(buf *bytes.Buffer, ev SSEEvent) {
 	wroteAny := false
 	if ev.Comment != "" {
-		for _, line := range strings.Split(ev.Comment, "\n") {
+		normComment := strings.ReplaceAll(ev.Comment, "\r\n", "\n")
+		for _, line := range strings.Split(normComment, "\n") {
 			buf.WriteString(": ")
 			buf.WriteString(line)
 			buf.WriteByte('\n')
@@ -287,7 +288,8 @@ func encodeSSEEventInto(buf *bytes.Buffer, ev SSEEvent) {
 		wroteAny = true
 	}
 	if ev.Data != "" || !wroteAny {
-		for _, line := range strings.Split(ev.Data, "\n") {
+		normData := strings.ReplaceAll(ev.Data, "\r\n", "\n")
+		for _, line := range strings.Split(normData, "\n") {
 			buf.WriteString("data: ")
 			buf.WriteString(line)
 			buf.WriteByte('\n')
@@ -870,12 +872,16 @@ func mergeGeminiUsage(dst *Usage, uMeta map[string]interface{}, candTokens *int,
 	}
 	updatedOut := false
 	if v, ok := uMeta["candidatesTokenCount"]; ok {
-		*candTokens = asInt(v)
-		updatedOut = true
+		if n := asInt(v); n > 0 || *candTokens == 0 {
+			*candTokens = n
+			updatedOut = true
+		}
 	}
 	if v, ok := uMeta["thoughtsTokenCount"]; ok {
-		*thoughtTokens = asInt(v)
-		updatedOut = true
+		if n := asInt(v); n > 0 || *thoughtTokens == 0 {
+			*thoughtTokens = n
+			updatedOut = true
+		}
 	}
 	if updatedOut {
 		out := *candTokens + *thoughtTokens

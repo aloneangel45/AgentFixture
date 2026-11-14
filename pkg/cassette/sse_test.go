@@ -416,3 +416,41 @@ func TestSSE_GoogleGeminiStreamReconstructionAndMetrics(t *testing.T) {
 		t.Errorf("expected positive Gemini cost saved USD, got %f", cas.Metadata.Metrics.EstimatedCostSavedUSD)
 	}
 }
+
+func TestGeminiSSE_TrailingZeroUsagePreservesTokensAndEncodeNormalizesCRLF(t *testing.T) {
+	// 1. Trailing Gemini metadata chunk with 0 candidatesTokenCount/thoughtsTokenCount must not clobber earlier accumulated counts.
+	rawSSE := strings.Join([]string{
+		`data: {"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"thinking..."},{"text":"Answer"}]}}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":45,"thoughtsTokenCount":15,"totalTokenCount":180},"modelVersion":"gemini-2.5-pro"}`,
+		"",
+		`data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":0,"thoughtsTokenCount":0},"modelVersion":"gemini-2.5-pro"}`,
+		"",
+		"",
+	}, "\n")
+
+	events, err := DecodeSSE(strings.NewReader(rawSSE))
+	if err != nil {
+		t.Fatalf("DecodeSSE failed: %v", err)
+	}
+	summary := ReconstructStreamSummary(events)
+	if summary.Usage.OutputTokens != 60 {
+		t.Fatalf("expected Gemini OutputTokens=60 (45+15) preserved despite trailing 0 usage chunk, got %d", summary.Usage.OutputTokens)
+	}
+
+	// 2. EncodeSSEEvent must normalize embedded CRLF (\r\n) in Data and Comment so it cannot forge blank-line frame boundaries.
+	ev := SSEEvent{
+		Comment: "keepalive\r\ninjected: bad",
+		Event:   "message",
+		Data:    "line1\r\n\r\nline3",
+	}
+	encoded := EncodeSSEEvent(ev)
+	roundTrip, err := DecodeSSE(strings.NewReader(string(encoded)))
+	if err != nil {
+		t.Fatalf("round-trip DecodeSSE failed: %v", err)
+	}
+	if len(roundTrip) != 1 {
+		t.Fatalf("expected exactly 1 SSE event (no forged frame boundary from CRLF), got %d", len(roundTrip))
+	}
+	if roundTrip[0].Data != "line1\n\nline3" {
+		t.Errorf("unexpected decoded Data after CRLF normalization: %q", roundTrip[0].Data)
+	}
+}

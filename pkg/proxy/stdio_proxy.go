@@ -74,6 +74,24 @@ func NewStdioReplayer(cas *cassette.Cassette, m matcher.Matcher) *StdioReplayer 
 	}
 }
 
+// MatchedCount returns how many unique cassette interactions have been replayed.
+func (sr *StdioReplayer) MatchedCount() int {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return len(sr.matchedIDs)
+}
+
+// MatchedIDs returns a thread-safe snapshot of matched cassette interaction IDs.
+func (sr *StdioReplayer) MatchedIDs() map[string]bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	cp := make(map[string]bool, len(sr.matchedIDs))
+	for k, v := range sr.matchedIDs {
+		cp[k] = v
+	}
+	return cp
+}
+
 // ProcessStream reads NDJSON or Content-Length framed messages up to 16MB and writes cassette responses.
 func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 	br := bufio.NewReaderSize(in, 64*1024)
@@ -90,25 +108,35 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 			continue
 		}
 
+		rawBytes := []byte(trimmed)
 		var rawObj map[string]json.RawMessage
-		var rpcReq JSONRPCRequest
-		if json.Unmarshal([]byte(trimmed), &rawObj) == nil && json.Unmarshal([]byte(trimmed), &rpcReq) == nil && rpcReq.Method != "" {
-			_, hasID := rawObj["id"]
-			// JSON-RPC 2.0 & MCP spec: Notifications omit "id" (or pass null id on notification methods) and MUST NOT receive a response.
-			if !hasID || rpcReq.ID == nil {
+		if json.Unmarshal(rawBytes, &rawObj) == nil {
+			if rpcReq, decErr := decodeJSONRPCRequest(rawBytes); decErr == nil && rpcReq.Method != "" {
+				_, hasID := rawObj["id"]
+				// JSON-RPC 2.0 & MCP spec: Notifications omit "id" (or pass null id on notification methods) and MUST NOT receive a response.
+				if !hasID || rpcReq.ID == nil {
+					continue
+				}
+				if err := sr.handleJSONRPC(rpcReq, out, framing); err != nil {
+					return err
+				}
 				continue
 			}
-			if err := sr.handleJSONRPC(rpcReq, out, framing); err != nil {
-				return err
-			}
-			continue
 		}
 
 		// Fallback: raw line or non-JSON-RPC tool invocation
 		req := &cassette.Request{
 			RawBody: trimmed,
 		}
-		inter := sr.findMatch(req)
+		redactedReq := req.Clone()
+		cassette.RedactRequest(&redactedReq)
+		redactedReq.Matcher.StrictHash = matcher.ComputeRequestHash(&redactedReq)
+
+		inter := sr.findMatch(&redactedReq)
+		if inter == nil && redactedReq.RawBody != req.RawBody {
+			req.Matcher.StrictHash = matcher.ComputeRequestHash(req)
+			inter = sr.findMatch(req)
+		}
 		if inter != nil {
 			result := inter.Response.ToolResult
 			if result == "" {
@@ -119,7 +147,7 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 			}
 		} else {
 			errPayload, _ := json.Marshal(map[string]string{
-				"error": "No cassette interaction matched input: " + trimmed,
+				"error": "No cassette interaction matched input: " + cassette.RedactString(trimmed),
 			})
 			if err := writeStdioFrame(out, errPayload, framing); err != nil {
 				return err
@@ -151,8 +179,25 @@ func (sr *StdioReplayer) handleJSONRPC(rpcReq JSONRPCRequest, out io.Writer, fra
 		ToolInput: toolArgs,
 		RawBody:   string(rpcReq.Params),
 	}
+	redactedCandidate := candidate.Clone()
+	cassette.RedactRequest(&redactedCandidate)
+	if redactedCandidate.ToolName != "" {
+		redactedCandidate.Matcher.StrictHash = matcher.ComputeToolHash(redactedCandidate.ToolName, redactedCandidate.ToolInput)
+	} else {
+		redactedCandidate.Matcher.StrictHash = matcher.ComputeRequestHash(&redactedCandidate)
+	}
 
-	inter := sr.findMatch(candidate)
+	inter := sr.findMatch(&redactedCandidate)
+	if inter == nil {
+		if candidate.ToolName != "" {
+			candidate.Matcher.StrictHash = matcher.ComputeToolHash(candidate.ToolName, candidate.ToolInput)
+		} else {
+			candidate.Matcher.StrictHash = matcher.ComputeRequestHash(candidate)
+		}
+		if redactedCandidate.Matcher.StrictHash != candidate.Matcher.StrictHash {
+			inter = sr.findMatch(candidate)
+		}
+	}
 	resp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      rpcReq.ID,
@@ -210,7 +255,7 @@ func (sr *StdioReplayer) synthesizeProtocolResponse(method string) (interface{},
 			},
 			"serverInfo": map[string]interface{}{
 				"name":    "AgentFixture-MCP-Replay",
-				"version": "1.2.0",
+				"version": cassette.GeneratorVersion,
 			},
 		}, true
 	case "tools/list":
@@ -395,28 +440,29 @@ func (r *StdioRecorder) pumpRequests(src io.Reader, dst io.Writer) error {
 		trimmed := bytes.TrimSpace(payload)
 		if len(trimmed) > 0 {
 			var rawObj map[string]json.RawMessage
-			var rpcReq JSONRPCRequest
-			if json.Unmarshal(trimmed, &rawObj) == nil && json.Unmarshal(trimmed, &rpcReq) == nil && rpcReq.Method != "" {
-				if _, hasID := rawObj["id"]; hasID && rpcReq.ID != nil {
-					var toolName string
-					var toolArgs map[string]interface{}
-					if strings.Contains(rpcReq.Method, "tool") && len(rpcReq.Params) > 0 {
-						if parsed, pErr := matcher.DecodeJSONUseNumber(rpcReq.Params); pErr == nil {
-							if pMap, ok := parsed.(map[string]interface{}); ok {
-								toolName, _ = pMap["name"].(string)
-								toolArgs, _ = pMap["arguments"].(map[string]interface{})
+			if json.Unmarshal(trimmed, &rawObj) == nil {
+				if rpcReq, decErr := decodeJSONRPCRequest(trimmed); decErr == nil && rpcReq.Method != "" {
+					if _, hasID := rawObj["id"]; hasID && rpcReq.ID != nil {
+						var toolName string
+						var toolArgs map[string]interface{}
+						if strings.Contains(rpcReq.Method, "tool") && len(rpcReq.Params) > 0 {
+							if parsed, pErr := matcher.DecodeJSONUseNumber(rpcReq.Params); pErr == nil {
+								if pMap, ok := parsed.(map[string]interface{}); ok {
+									toolName, _ = pMap["name"].(string)
+									toolArgs, _ = pMap["arguments"].(map[string]interface{})
+								}
 							}
 						}
+						key := rpcIDKey(rpcReq.ID)
+						r.mu.Lock()
+						r.pending[key] = pendingRPC{
+							req:      rpcReq,
+							toolName: toolName,
+							toolArgs: toolArgs,
+							sentAt:   time.Now(),
+						}
+						r.mu.Unlock()
 					}
-					key := rpcIDKey(rpcReq.ID)
-					r.mu.Lock()
-					r.pending[key] = pendingRPC{
-						req:      rpcReq,
-						toolName: toolName,
-						toolArgs: toolArgs,
-						sentAt:   time.Now(),
-					}
-					r.mu.Unlock()
 				}
 			}
 		}
@@ -435,8 +481,7 @@ func (r *StdioRecorder) pumpResponses(src io.Reader, dst io.Writer) error {
 		}
 		trimmed := bytes.TrimSpace(payload)
 		if len(trimmed) > 0 {
-			var rpcResp JSONRPCResponse
-			if json.Unmarshal(trimmed, &rpcResp) == nil && rpcResp.ID != nil {
+			if rpcResp, decErr := decodeJSONRPCResponse(trimmed); decErr == nil && rpcResp.ID != nil {
 				key := rpcIDKey(rpcResp.ID)
 				r.mu.Lock()
 				pend, ok := r.pending[key]
@@ -522,12 +567,17 @@ func extractMCPTextContent(result interface{}) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	// Preserve full structured result in Response.Body whenever additional MCP fields
+	// such as "isError": true, "structuredContent", or "_meta" are present.
+	if len(m) != 1 {
+		return "", false
+	}
 	contentSlice, ok := m["content"].([]interface{})
 	if !ok || len(contentSlice) != 1 {
 		return "", false
 	}
 	first, ok := contentSlice[0].(map[string]interface{})
-	if !ok {
+	if !ok || len(first) != 2 {
 		return "", false
 	}
 	if t, _ := first["type"].(string); t != "text" {
@@ -537,9 +587,90 @@ func extractMCPTextContent(result interface{}) (string, bool) {
 	return txt, ok
 }
 
+func decodeJSONRPCRequest(data []byte) (JSONRPCRequest, error) {
+	var req JSONRPCRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func decodeJSONRPCResponse(data []byte) (JSONRPCResponse, error) {
+	var resp JSONRPCResponse
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&resp); err != nil {
+		return resp, err
+	}
+	resp.Result = normalizeStdioJSONNumbers(resp.Result)
+	resp.Error = normalizeStdioJSONNumbers(resp.Error)
+	return resp, nil
+}
+
+func normalizeStdioJSONNumbers(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, el := range val {
+			out[k] = normalizeStdioJSONNumbers(el)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, el := range val {
+			out[i] = normalizeStdioJSONNumbers(el)
+		}
+		return out
+	case json.Number:
+		s := val.String()
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+		if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return u
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+		return s
+	default:
+		return val
+	}
+}
+
 func rpcIDKey(id interface{}) string {
-	b, _ := json.Marshal(id)
-	return string(b)
+	switch v := id.(type) {
+	case string:
+		return "s:" + v
+	case json.Number:
+		s := v.String()
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return "n:" + strconv.FormatInt(i, 10)
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil && float64(int64(f)) == f {
+			return "n:" + strconv.FormatInt(int64(f), 10)
+		}
+		return "n:" + s
+	case float64:
+		if float64(int64(v)) == v {
+			return "n:" + strconv.FormatInt(int64(v), 10)
+		}
+		return fmt.Sprintf("n:%g", v)
+	case int:
+		return "n:" + strconv.Itoa(v)
+	case int64:
+		return "n:" + strconv.FormatInt(v, 10)
+	default:
+		b, _ := json.Marshal(id)
+		return string(b)
+	}
+}
+
+func isMIMEHeaderLine(trimmed string) bool {
+	lower := strings.ToLower(trimmed)
+	return strings.HasPrefix(lower, "content-length:") || strings.HasPrefix(lower, "content-type:")
 }
 
 func readStdioFrame(br *bufio.Reader) ([]byte, stdioFraming, error) {
@@ -562,29 +693,55 @@ func readStdioFrame(br *bufio.Reader) ([]byte, stdioFraming, error) {
 			continue
 		}
 
-		if strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
-			valStr := strings.TrimSpace(trimmed[len("content-length:"):])
-			n, convErr := strconv.Atoi(valStr)
-			if convErr != nil || n < 0 {
-				return nil, framingContentLength, fmt.Errorf("invalid Content-Length header %q", trimmed)
+		if isMIMEHeaderLine(trimmed) {
+			if err == io.EOF {
+				return nil, framingContentLength, io.ErrUnexpectedEOF
 			}
-			if n > MaxStdioMessageBytes {
-				return nil, framingContentLength, fmt.Errorf("MCP Content-Length %d exceeds 16MB limit", n)
+			contentLen := -1
+			if strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
+				valStr := strings.TrimSpace(trimmed[len("content-length:"):])
+				n, convErr := strconv.Atoi(valStr)
+				if convErr != nil || n < 0 {
+					return nil, framingContentLength, fmt.Errorf("invalid Content-Length header %q", trimmed)
+				}
+				contentLen = n
 			}
 
 			// Consume remaining MIME headers until blank line ("\r\n" or "\n")
 			for {
 				hdrLine, hdrErr := readBoundedLine(br, 64*1024)
+				hdrTrimmed := strings.TrimRight(string(hdrLine), "\r\n")
 				if hdrErr != nil {
+					if hdrErr == io.EOF {
+						return nil, framingContentLength, io.ErrUnexpectedEOF
+					}
 					return nil, framingContentLength, hdrErr
 				}
-				if strings.TrimRight(string(hdrLine), "\r\n") == "" {
+				if hdrTrimmed == "" {
 					break
+				}
+				if strings.HasPrefix(strings.ToLower(hdrTrimmed), "content-length:") {
+					valStr := strings.TrimSpace(hdrTrimmed[len("content-length:"):])
+					n, convErr := strconv.Atoi(valStr)
+					if convErr != nil || n < 0 {
+						return nil, framingContentLength, fmt.Errorf("invalid Content-Length header %q", hdrTrimmed)
+					}
+					contentLen = n
 				}
 			}
 
-			payload := make([]byte, n)
+			if contentLen < 0 {
+				return nil, framingContentLength, fmt.Errorf("missing Content-Length in MCP stdio header block")
+			}
+			if contentLen > MaxStdioMessageBytes {
+				return nil, framingContentLength, fmt.Errorf("MCP Content-Length %d exceeds 16MB limit", contentLen)
+			}
+
+			payload := make([]byte, contentLen)
 			if _, readErr := io.ReadFull(br, payload); readErr != nil {
+				if readErr == io.EOF {
+					return nil, framingContentLength, io.ErrUnexpectedEOF
+				}
 				return nil, framingContentLength, readErr
 			}
 			return payload, framingContentLength, nil

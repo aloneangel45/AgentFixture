@@ -24,13 +24,13 @@ import (
 )
 
 func TestCLI_VersionFormattingNoDoubleV(t *testing.T) {
-	if got := formatVersionString("v1.2.0"); !strings.Contains(got, "AgentFixture v1.2.0") || strings.Contains(got, "vv1.2.0") {
-		t.Fatalf("unexpected version formatting for v1.2.0: %q", got)
+	if got := formatVersionString("v1.2.1"); !strings.Contains(got, "AgentFixture v1.2.1") || strings.Contains(got, "vv1.2.1") {
+		t.Fatalf("unexpected version formatting for v1.2.1: %q", got)
 	}
-	if got := formatVersionString("1.2.0"); !strings.Contains(got, "AgentFixture v1.2.0") {
-		t.Fatalf("unexpected version formatting for 1.2.0: %q", got)
+	if got := formatVersionString("1.2.1"); !strings.Contains(got, "AgentFixture v1.2.1") {
+		t.Fatalf("unexpected version formatting for 1.2.1: %q", got)
 	}
-	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.2.0") {
+	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.2.1") {
 		t.Fatalf("unexpected empty fallback version formatting: %q", got)
 	}
 }
@@ -593,7 +593,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	// Build a tiny real zip containing a compiled Windows helper binary that prints version
 	tmpDir := t.TempDir()
 	binSrc := filepath.Join(tmpDir, "stub.go")
-	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.2.0 (installer-test)\") }\n"), 0644); err != nil {
+	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.2.1 (installer-test)\") }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	builtExe := filepath.Join(tmpDir, "agentfixture.exe")
@@ -658,7 +658,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install.ps1 failed on valid SHA-256 archive: %v\nOutput:\n%s", err, string(outOK))
 	}
-	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.2.0") {
+	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.2.1") {
 		t.Errorf("unexpected install.ps1 output:\n%s", string(outOK))
 	}
 	if _, statErr := os.Stat(filepath.Join(installDirOK, "agentfixture.exe")); statErr != nil {
@@ -680,5 +680,104 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(installDirBad, "agentfixture.exe")); !os.IsNotExist(statErr) {
 		t.Fatalf("SECURITY FAILURE: tampered binary was written to %s", installDirBad)
+	}
+}
+
+func TestCLI_TrailingFlagsAfterPositionalArgsAndStructuredDiffAndRedact(t *testing.T) {
+	tmpDir := t.TempDir()
+	rawPath := filepath.Join(tmpDir, "raw_gemini.yaml")
+	redactedPath := filepath.Join(tmpDir, "clean_gemini.yaml")
+
+	cas := cassette.NewCassette("cas_trailing_flags")
+	cas.Interactions = []cassette.Interaction{
+		{
+			ID:       "int_gem_01",
+			Sequence: 1,
+			Type:     cassette.InteractionTypeHTTP,
+			Request: cassette.Request{
+				Method:   "POST",
+				Endpoint: "/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSyTestSecretKey1234567890123456789",
+				RawBody:  `{"contents":[{"role":"user","parts":[{"text":"Audit deployment logs"}]}],"generationConfig":{"temperature":0}}`,
+			},
+			Response: cassette.Response{
+				StatusCode: 200,
+				Body: map[string]interface{}{
+					"content": []interface{}{map[string]interface{}{"type": "text", "text": "ok"}},
+					"isError": false,
+				},
+			},
+		},
+	}
+	if err := cassette.Save(rawPath, cas); err != nil {
+		t.Fatalf("failed to write raw cassette: %v", err)
+	}
+
+	// 1. `redact <file> -out <dest>` (trailing value flag after positional arg!)
+	if err := handleRedact([]string{rawPath, "-out", redactedPath}); err != nil {
+		t.Fatalf("handleRedact with trailing -out failed: %v", err)
+	}
+	scrubbed, err := cassette.Load(redactedPath)
+	if err != nil {
+		t.Fatalf("failed to load redacted cassette: %v", err)
+	}
+	if scrubbed.Interactions[0].Request.Matcher.FuzzySignature.NormalizedPrompt != "user: Audit deployment logs" {
+		t.Errorf("expected extracted Gemini NormalizedPrompt 'user: Audit deployment logs', got %q",
+			scrubbed.Interactions[0].Request.Matcher.FuzzySignature.NormalizedPrompt)
+	}
+	if scrubbed.Interactions[0].Request.Matcher.FuzzySignature.Model != "gemini-2.5-pro" {
+		t.Errorf("expected extracted Gemini URL model 'gemini-2.5-pro', got %q",
+			scrubbed.Interactions[0].Request.Matcher.FuzzySignature.Model)
+	}
+
+	// 2. `verify <file> -json -junit <xml>` (trailing bool + value flags after positional arg!)
+	junitOut := filepath.Join(tmpDir, "verify-trailing.xml")
+	verifyOut, err := captureStdout(t, func() error {
+		return handleVerify([]string{redactedPath, "-json", "-junit", junitOut})
+	})
+	if err != nil {
+		t.Fatalf("handleVerify with trailing flags failed: %v", err)
+	}
+	if !strings.Contains(verifyOut, `"passed": true`) {
+		t.Errorf("expected JSON verify output when -json trails positional arg, got:\n%s", verifyOut)
+	}
+	if _, err := os.Stat(junitOut); err != nil {
+		t.Errorf("expected JUnit XML written when -junit trails positional arg: %v", err)
+	}
+
+	// 3. `inspect <file> -json` (trailing bool flag after positional arg!)
+	inspectOut, err := captureStdout(t, func() error {
+		return handleInspect([]string{redactedPath, "-json"})
+	})
+	if err != nil {
+		t.Fatalf("handleInspect with trailing -json failed: %v", err)
+	}
+	if !strings.Contains(inspectOut, `"cassette_id": "cas_trailing_flags"`) {
+		t.Errorf("expected JSON inspect output when -json trails positional arg, got:\n%s", inspectOut)
+	}
+
+	// 4. `diff <cas1> <cas2> -exit-code` detecting Response.Body (isError: true) and Response.Error drift!
+	driftedBodyPath := filepath.Join(tmpDir, "drifted_body.yaml")
+	casBodyDrift := scrubbed.Clone()
+	casBodyDrift.Interactions[0].Response.Body = map[string]interface{}{
+		"content": []interface{}{map[string]interface{}{"type": "text", "text": "ok"}},
+		"isError": true,
+	}
+	if err := cassette.Save(driftedBodyPath, casBodyDrift); err != nil {
+		t.Fatal(err)
+	}
+	diffErr := handleDiff([]string{redactedPath, driftedBodyPath, "-exit-code"})
+	if !errors.Is(diffErr, errDiffDetected) {
+		t.Fatalf("expected handleDiff with trailing -exit-code to detect Response.Body drift, got: %v", diffErr)
+	}
+
+	driftedErrPath := filepath.Join(tmpDir, "drifted_err.yaml")
+	casErrDrift := scrubbed.Clone()
+	casErrDrift.Interactions[0].Response.Error = "tool execution timed out"
+	if err := cassette.Save(driftedErrPath, casErrDrift); err != nil {
+		t.Fatal(err)
+	}
+	diffErr2 := handleDiff([]string{redactedPath, driftedErrPath, "-exit-code"})
+	if !errors.Is(diffErr2, errDiffDetected) {
+		t.Fatalf("expected handleDiff to detect Response.Error drift, got: %v", diffErr2)
 	}
 }

@@ -46,12 +46,13 @@ type TracePortFrame struct {
 
 // TracePortSession represents the top-level flight recording JSON session from TracePort.
 type TracePortSession struct {
-	ID        string           `json:"id"`
-	Command   string           `json:"command"`
-	StartTime time.Time        `json:"start_time"`
-	EndTime   time.Time        `json:"end_time,omitempty"`
-	Status    string           `json:"status"`
-	Frames    []TracePortFrame `json:"frames"`
+	ID        string            `json:"id"`
+	Command   string            `json:"command"`
+	StartTime time.Time         `json:"start_time"`
+	EndTime   time.Time         `json:"end_time,omitempty"`
+	Status    string            `json:"status"`
+	Tags      map[string]string `json:"tags,omitempty"`
+	Frames    []TracePortFrame  `json:"frames"`
 }
 
 // ImportTracePortSession converts raw TracePort flight recording JSON bytes into a clean Cassette.
@@ -78,9 +79,27 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 	if cas.Metadata.Tags == nil {
 		cas.Metadata.Tags = make(map[string]string)
 	}
+	for k, v := range sess.Tags {
+		cas.Metadata.Tags[k] = v
+	}
 	cas.Metadata.Tags["traceport_session_id"] = sess.ID
 	cas.Metadata.Tags["command"] = redactedCommand
 	cas.Metadata.Tags["status"] = sess.Status
+
+	usedIDs := make(map[string]bool, len(sess.Frames))
+	allocInteractionID := func(base string) string {
+		if !usedIDs[base] {
+			usedIDs[base] = true
+			return base
+		}
+		for suffix := 2; ; suffix++ {
+			candidate := fmt.Sprintf("%s_%d", base, suffix)
+			if !usedIDs[candidate] {
+				usedIDs[candidate] = true
+				return candidate
+			}
+		}
+	}
 
 	seq := 1
 	n := len(sess.Frames)
@@ -133,10 +152,13 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 				}
 			}
 
+			if latency < 0 {
+				latency = 0
+			}
 			strictHash := matcher.ComputeToolHash(toolName, redactedArgs)
 
 			inter := cassette.Interaction{
-				ID:       fmt.Sprintf("tp_step_%d", frame.Index),
+				ID:       allocInteractionID(fmt.Sprintf("tp_step_%d", frame.Index)),
 				Sequence: seq,
 				Type:     cassette.InteractionTypeTool,
 				Request: cassette.Request{
@@ -187,10 +209,16 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 				},
 			}
 
+			turnLatency := int64(0)
+			if !nextFrame.Timestamp.IsZero() && !frame.Timestamp.IsZero() {
+				if d := nextFrame.Timestamp.Sub(frame.Timestamp).Milliseconds(); d > 0 {
+					turnLatency = d
+				}
+			}
 			resp := cassette.Response{
 				StatusCode: 200,
 				RawBody:    redactedNext,
-				LatencyMs:  nextFrame.Timestamp.Sub(frame.Timestamp).Milliseconds(),
+				LatencyMs:  turnLatency,
 			}
 			if nextFrame.Type == EventError {
 				resp.StatusCode = 500
@@ -199,7 +227,7 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 			}
 
 			inter := cassette.Interaction{
-				ID:       fmt.Sprintf("tp_turn_%d", frame.Index),
+				ID:       allocInteractionID(fmt.Sprintf("tp_turn_%d", frame.Index)),
 				Sequence: seq,
 				Type:     cassette.InteractionTypeLLMChat,
 				Request:  req,
@@ -208,6 +236,11 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 					"input_index":  fmt.Sprintf("%d", frame.Index),
 					"output_index": fmt.Sprintf("%d", nextFrame.Index),
 				},
+			}
+			if nextFrame.GitSnapshot != "" {
+				inter.Metadata["git_snapshot"] = nextFrame.GitSnapshot
+			} else if frame.GitSnapshot != "" {
+				inter.Metadata["git_snapshot"] = frame.GitSnapshot
 			}
 			cas.Interactions = append(cas.Interactions, inter)
 			seq++
@@ -251,7 +284,7 @@ func ImportTracePortSession(sessionJSON []byte) (*cassette.Cassette, error) {
 			}
 
 			inter := cassette.Interaction{
-				ID:       fmt.Sprintf("tp_err_%d", frame.Index),
+				ID:       allocInteractionID(fmt.Sprintf("tp_err_%d", frame.Index)),
 				Sequence: seq,
 				Type:     interType,
 				Request:  req,

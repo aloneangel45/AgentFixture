@@ -191,3 +191,89 @@ func TestCheckForUnredactedSecrets_MasksPreviewAndDetectsHeaders(t *testing.T) {
 		t.Fatalf("expected cassette to be clean after RedactCassette, got: %s", afterReason)
 	}
 }
+
+func TestRedaction_QueryKeyRawJSONAndNestedSliceSecrets(t *testing.T) {
+	// 1. Custom non-AIza ?key= and ?token= query parameters + RawBody JSON sensitive keys (when Body == nil)
+	cas := NewCassette("cas_query_rawjson")
+	cas.Interactions = []Interaction{
+		{
+			ID:       "int_q1",
+			Sequence: 1,
+			Type:     InteractionTypeSSE,
+			Request: Request{
+				Method:   "POST",
+				Endpoint: "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=custom-gateway-key-98765&token=custom-tok-123",
+				RawBody:  `{"job_id":9007199254740993,"credentials":[{"password":"super-secret-db-password","client_secret":"oauth-raw-secret"}]}`,
+			},
+			Response: Response{
+				StatusCode: 200,
+				SSEEvents: []SSEEvent{
+					{Event: "message", Data: `{"echo_secret":{"api_key":"custom-inline-key-xyz"}}`},
+				},
+			},
+		},
+	}
+
+	if hasSec, _ := CheckForUnredactedSecrets(cas); !hasSec {
+		t.Fatalf("expected unredacted ?key= / RawBody password to be flagged before RedactCassette")
+	}
+
+	// Verify RawBody-only secret detection even when Endpoint is clean
+	rawOnlyCas := NewCassette("cas_raw_only")
+	rawOnlyCas.Interactions = []Interaction{
+		{
+			ID:       "int_raw",
+			Sequence: 1,
+			Type:     InteractionTypeHTTP,
+			Request: Request{
+				Method:   "POST",
+				Endpoint: "/v1/login",
+				RawBody:  `{"username":"alice","password":"my-plaintext-password"}`,
+			},
+		},
+	}
+	if hasSec, reason := CheckForUnredactedSecrets(rawOnlyCas); !hasSec {
+		t.Fatalf("expected unredacted JSON RawBody password to be flagged")
+	} else if strings.Contains(reason, "my-plaintext-password") {
+		t.Fatalf("secret leaked in reason string: %s", reason)
+	}
+
+	// Verify nested slice secret detection in structured Body
+	sliceCas := NewCassette("cas_slice_body")
+	sliceCas.Interactions = []Interaction{
+		{
+			ID:       "int_slice",
+			Sequence: 1,
+			Type:     InteractionTypeHTTP,
+			Request: Request{
+				Method:   "POST",
+				Endpoint: "/v1/batch",
+				Body: []interface{}{
+					map[string]interface{}{
+						"items": []interface{}{
+							map[string]interface{}{"private_key": "raw-private-material"},
+						},
+					},
+				},
+			},
+		},
+	}
+	if hasSec, _ := CheckForUnredactedSecrets(sliceCas); !hasSec {
+		t.Fatalf("expected unredacted secret inside nested []interface{} Body to be flagged")
+	}
+
+	// Scrub all three cassettes and verify CheckForUnredactedSecrets passes AND 64-bit integer precision survives
+	for _, target := range []*Cassette{cas, rawOnlyCas, sliceCas} {
+		RedactCassette(target)
+		if hasSec, reason := CheckForUnredactedSecrets(target); hasSec {
+			t.Fatalf("expected %s to pass CheckForUnredactedSecrets after RedactCassette, got: %s", target.Metadata.CassetteID, reason)
+		}
+	}
+
+	if !strings.Contains(cas.Interactions[0].Request.RawBody, "9007199254740993") {
+		t.Errorf("expected 64-bit integer 9007199254740993 preserved in redacted RawBody, got: %s", cas.Interactions[0].Request.RawBody)
+	}
+	if strings.Contains(cas.Interactions[0].Request.Endpoint, "custom-gateway-key-98765") {
+		t.Errorf("expected ?key= query secret scrubbed from Endpoint, got: %s", cas.Interactions[0].Request.Endpoint)
+	}
+}

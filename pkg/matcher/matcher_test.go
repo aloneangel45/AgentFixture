@@ -317,3 +317,105 @@ func TestLevenshteinDistance(t *testing.T) {
 		t.Errorf("expected similarity 0.0, got %f", simEmpty)
 	}
 }
+
+func TestMatcher_GeminiQuerySecretCanonicalization(t *testing.T) {
+	strict := NewStrictMatcher()
+	fuzzy := NewFuzzyMatcher(0.85)
+
+	recorded := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=[REDACTED_GOOGLE_KEY]",
+		RawBody:  `{"contents":[{"role":"user","parts":[{"text":"Check cluster status"}]}]}`,
+	}
+	recorded.Matcher.StrictHash = ComputeRequestHash(recorded)
+
+	// Offline replay where GEMINI_API_KEY is a non-AIza dummy string (e.g. "af-offline-replay-key")
+	replayDummyKey := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=af-offline-replay-key&alt=sse",
+		RawBody:  `{"contents":[{"parts":[{"text":"Check cluster status"}],"role":"user"}]}`,
+	}
+
+	if res := strict.Match(recorded, replayDummyKey); !res.Matched {
+		t.Fatalf("expected StrictMatcher to match recorded [REDACTED_GOOGLE_KEY] against replay ?key=af-offline-replay-key, got: %+v", res)
+	}
+	if res := fuzzy.Match(recorded, replayDummyKey); !res.Matched {
+		t.Fatalf("expected FuzzyMatcher to match recorded [REDACTED_GOOGLE_KEY] against replay ?key=af-offline-replay-key, got: %+v", res)
+	}
+
+	// FuzzyMatcher should also match when replay switches from ?key=... query auth to x-goog-api-key header (?alt=sse only)
+	replayHeaderAuth := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+		Headers:  map[string]string{"x-goog-api-key": "af-offline-replay-key"},
+		RawBody:  `{"contents":[{"role":"user","parts":[{"text":"Check cluster status"}]}]}`,
+	}
+	if res := fuzzy.Match(recorded, replayHeaderAuth); !res.Matched {
+		t.Fatalf("expected FuzzyMatcher to match ?alt=sse&key=... against header-authenticated ?alt=sse, got: %+v", res)
+	}
+}
+
+func TestFuzzyMatcher_GeminiAnthropicSignatureOnlyAndToolSchemaIsolation(t *testing.T) {
+	fuzzy := NewFuzzyMatcher(0.80)
+
+	// 1. Google Gemini contents + systemInstruction + URL model extraction + generationConfig tweak
+	gemExpected := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1beta/models/gemini-2.5-pro:generateContent",
+		RawBody:  `{"systemInstruction":{"parts":[{"text":"You are a Go security auditor."}]},"contents":[{"role":"user","parts":[{"text":"Inspect pkg/proxy for leaks."}]}],"generationConfig":{"temperature":0.0,"maxOutputTokens":1024}}`,
+	}
+	prompt, model := ExtractPromptAndModel(gemExpected)
+	if model != "gemini-2.5-pro" {
+		t.Fatalf("expected model 'gemini-2.5-pro' extracted from Gemini URL, got %q", model)
+	}
+	if !strings.Contains(prompt, "system: You are a Go security auditor.") || !strings.Contains(prompt, "user: Inspect pkg/proxy") {
+		t.Fatalf("expected Gemini systemInstruction + contents extracted into prompt, got %q", prompt)
+	}
+
+	gemActual := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1beta/models/gemini-2.5-pro:generateContent",
+		RawBody:  `{"systemInstruction":{"parts":[{"text":"You are a Go security auditor."}]},"contents":[{"role":"user","parts":[{"text":"Inspect pkg/proxy for leaks."}]}],"generationConfig":{"temperature":0.2,"topP":0.95,"maxOutputTokens":4096}}`,
+	}
+	if res := fuzzy.Match(gemExpected, gemActual); !res.Matched {
+		t.Fatalf("expected FuzzyMatcher to match Gemini prompt despite generationConfig tweaks, got %+v", res)
+	}
+
+	// 2. Signature-only cassette (Body/RawBody omitted, only Matcher.FuzzySignature.NormalizedPrompt stored)
+	sigOnlyExpected := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1/messages",
+		Matcher: cassette.MatcherMeta{
+			FuzzySignature: cassette.FuzzySignature{
+				NormalizedPrompt: NormalizeText("You are helpful.\nExplain deterministic VCR testing for AI agents."),
+				Model:            "claude-sonnet-4-20250514",
+			},
+		},
+	}
+	anthActual := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1/messages",
+		RawBody:  `{"model":"claude-sonnet-4-20250514","system":[{"type":"text","text":"You are helpful."}],"messages":[{"role":"user","content":"Explain deterministic VCR testing for AI agents."}],"max_tokens":1024}`,
+	}
+	if res := fuzzy.Match(sigOnlyExpected, anthActual); !res.Matched {
+		t.Fatalf("expected signature-only cassette to match structured Anthropic request, got %+v", res)
+	}
+
+	// 3. Adversarial guard: unrelated short prompts sharing a huge identical tools schema MUST NOT match!
+	bigToolsSchema := strings.Repeat(`{"name":"read_file","description":"Reads a file from workspace disk safely","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}},`, 20)
+	bigToolsSchema = "[" + strings.TrimSuffix(bigToolsSchema, ",") + "]"
+
+	unrelatedA := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1/chat/completions",
+		RawBody:  fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":"Delete all expired staging caches immediately"}],"tools":%s}`, bigToolsSchema),
+	}
+	unrelatedB := &cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1/chat/completions",
+		RawBody:  fmt.Sprintf(`{"model":"gpt-4o","messages":[{"role":"user","content":"Translate this poem into classical French"}],"tools":%s}`, bigToolsSchema),
+	}
+	if res := fuzzy.Match(unrelatedA, unrelatedB); res.Matched {
+		t.Fatalf("ADVERSARIAL FAILURE: unrelated user prompts matched (score=%.3f) solely due to shared large tools schema!", res.Score)
+	}
+}

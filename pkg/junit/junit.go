@@ -372,12 +372,51 @@ func WriteFile(path string, suites TestSuites) error {
 		return err
 	}
 	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
+	if dir == "" {
+		dir = "."
+	}
+	if dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create junit report directory %s: %w", dir, err)
 		}
 	}
-	return os.WriteFile(path, data, 0644)
+
+	tmp, err := os.CreateTemp(dir, ".agentfixture-junit-tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary junit file in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary junit file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary junit file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary junit file: %w", err)
+	}
+	_ = os.Chmod(tmpPath, 0644)
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		// On Windows, renaming onto an existing read-only or locked destination may fail unless removed first.
+		if rmErr := os.Remove(path); rmErr == nil {
+			if retryErr := os.Rename(tmpPath, path); retryErr == nil {
+				committed = true
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to atomically replace junit file %s: %w", path, err)
+	}
+	committed = true
+	return nil
 }
 
 func describeInteraction(inter *cassette.Interaction) string {

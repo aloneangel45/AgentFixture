@@ -10,6 +10,9 @@ import (
 // CurrentVersion is the active schema version for AgentFixture cassettes.
 const CurrentVersion = "agentfixture/v1"
 
+// GeneratorVersion is the current semantic release version of AgentFixture.
+const GeneratorVersion = "1.2.1"
+
 // InteractionType identifies the category of recorded interaction.
 type InteractionType string
 
@@ -120,7 +123,7 @@ func NewCassette(cassetteID string) *Cassette {
 		Metadata: Metadata{
 			CassetteID: cassetteID,
 			RecordedAt: time.Now().UTC(),
-			Generator:  "AgentFixture v1.2.0",
+			Generator:  "AgentFixture v" + GeneratorVersion,
 			Tags:       make(map[string]string),
 		},
 		Interactions: make([]Interaction, 0),

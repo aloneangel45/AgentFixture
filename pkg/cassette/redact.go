@@ -1,8 +1,10 @@
 package cassette
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -20,8 +22,21 @@ var (
 	slackTokenRegex    = regexp.MustCompile(`\bxox[baprs]-[0-9A-Za-z-]{10,}\b`)
 	huggingFaceRegex   = regexp.MustCompile(`\bhf_[a-zA-Z0-9]{20,}\b`)
 	urlBasicAuthRegex  = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@\[\]]+:)([^@\s/\[\]]+)(@)`)
-	querySecretRegex   = regexp.MustCompile(`(?i)([?&](?:api_key|apikey|access_token|client_secret|password|secret|x-goog-api-key)=)([^&\s"'\[\]]+)`)
+	querySecretRegex   = regexp.MustCompile(`(?i)([?&](?:key|api_key|apikey|access_token|auth_token|token|client_secret|password|secret|x-goog-api-key)=)([^&\s"'\[\]]+)`)
 )
+
+var sensitiveQueryParamNames = map[string]bool{
+	"key":            true,
+	"api_key":        true,
+	"apikey":         true,
+	"access_token":   true,
+	"auth_token":     true,
+	"token":          true,
+	"client_secret":  true,
+	"password":       true,
+	"secret":         true,
+	"x-goog-api-key": true,
+}
 
 var sensitiveHeaderNames = map[string]bool{
 	"authorization":       true,
@@ -56,6 +71,44 @@ var sensitiveKeyNames = map[string]bool{
 	"set-cookie":     true,
 	"session_token":  true,
 	"auth_token":     true,
+}
+
+var rawBodySensitiveKeys = map[string]bool{
+	"password":       true,
+	"passwd":         true,
+	"secret":         true,
+	"api_key":        true,
+	"apikey":         true,
+	"x_api_key":      true,
+	"x-api-key":      true,
+	"x-goog-api-key": true,
+	"access_token":   true,
+	"refresh_token":  true,
+	"id_token":       true,
+	"private_key":    true,
+	"client_secret":  true,
+	"authorization":  true,
+	"cookie":         true,
+	"set-cookie":     true,
+	"session_token":  true,
+	"auth_token":     true,
+}
+
+var rawBodyKeyTokens = []string{
+	`"password"`, `"passwd"`, `"secret"`, `"api_key"`, `"apikey"`,
+	`"x_api_key"`, `"x-api-key"`, `"x-goog-api-key"`, `"access_token"`,
+	`"refresh_token"`, `"id_token"`, `"private_key"`, `"client_secret"`,
+	`"authorization"`, `"cookie"`, `"set-cookie"`, `"session_token"`, `"auth_token"`,
+}
+
+// IsSensitiveQueryParam reports whether a URL query parameter key carries credentials or API keys.
+func IsSensitiveQueryParam(name string) bool {
+	return sensitiveQueryParamNames[strings.ToLower(strings.TrimSpace(name))]
+}
+
+// IsRedactedPlaceholder reports whether val is empty or already replaced with a [REDACTED...] placeholder.
+func IsRedactedPlaceholder(val string) bool {
+	return isRedactedPlaceholder(val)
 }
 
 // RedactString sanitizes known API keys, tokens, PEM keys, URL credentials, and secrets from arbitrary text.
@@ -201,9 +254,9 @@ func RedactRequest(req *Request) {
 	if req == nil {
 		return
 	}
-	req.Endpoint = RedactString(req.Endpoint)
+	req.Endpoint = redactEndpointQuery(RedactString(req.Endpoint))
 	req.Headers = RedactHeaders(req.Headers)
-	req.RawBody = RedactString(req.RawBody)
+	req.RawBody = redactJSONRawBody(RedactString(req.RawBody))
 	if req.Body != nil {
 		req.Body = RedactValue(req.Body)
 	}
@@ -225,16 +278,146 @@ func RedactInteraction(inter *Interaction) {
 	inter.Metadata = RedactStringMap(inter.Metadata)
 
 	inter.Response.Headers = RedactHeaders(inter.Response.Headers)
-	inter.Response.RawBody = RedactString(inter.Response.RawBody)
+	inter.Response.RawBody = redactJSONRawBody(RedactString(inter.Response.RawBody))
 	inter.Response.ToolResult = RedactString(inter.Response.ToolResult)
 	inter.Response.Error = RedactString(inter.Response.Error)
 	if inter.Response.Body != nil {
 		inter.Response.Body = RedactValue(inter.Response.Body)
 	}
 	for i := range inter.Response.SSEEvents {
-		inter.Response.SSEEvents[i].Data = RedactString(inter.Response.SSEEvents[i].Data)
+		inter.Response.SSEEvents[i].Data = redactJSONRawBody(RedactString(inter.Response.SSEEvents[i].Data))
 		inter.Response.SSEEvents[i].Comment = RedactString(inter.Response.SSEEvents[i].Comment)
 		inter.Response.SSEEvents[i].ID = RedactString(inter.Response.SSEEvents[i].ID)
+	}
+}
+
+func redactEndpointQuery(endpoint string) string {
+	if strings.IndexByte(endpoint, '?') == -1 {
+		return endpoint
+	}
+	rawQuery := extractEndpointRawQuery(endpoint)
+	if rawQuery == "" {
+		return endpoint
+	}
+	vals, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return endpoint
+	}
+	needsRewrite := false
+	for k, list := range vals {
+		if IsSensitiveQueryParam(k) {
+			paramNeedsRewrite := false
+			for _, item := range list {
+				if !isRedactedPlaceholder(item) {
+					paramNeedsRewrite = true
+					break
+				}
+			}
+			if paramNeedsRewrite {
+				vals.Set(k, "[REDACTED]")
+				needsRewrite = true
+			}
+		}
+	}
+	if !needsRewrite {
+		return endpoint
+	}
+	qIdx := strings.IndexByte(endpoint, '?')
+	return endpoint[:qIdx+1] + strings.ReplaceAll(vals.Encode(), "%5BREDACTED%5D", "[REDACTED]")
+}
+
+func extractEndpointRawQuery(endpoint string) string {
+	qIdx := strings.IndexByte(endpoint, '?')
+	if qIdx == -1 {
+		return ""
+	}
+	q := endpoint[qIdx+1:]
+	if fIdx := strings.IndexByte(q, '#'); fIdx != -1 {
+		q = q[:fIdx]
+	}
+	return q
+}
+
+func hasRawBodySensitiveKey(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 6 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return false
+	}
+	if strings.IndexByte(trimmed, ':') == -1 {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, tok := range rawBodyKeyTokens {
+		if strings.Contains(lower, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactJSONRawBody(s string) string {
+	if !hasRawBodySensitiveKey(s) {
+		return s
+	}
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return s
+	}
+	redacted, changed := redactRawJSONValue(parsed)
+	if !changed {
+		return s
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(redacted); err != nil {
+		return s
+	}
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+func redactRawJSONValue(val interface{}) (interface{}, bool) {
+	switch v := val.(type) {
+	case map[string]interface{}:
+		changed := false
+		out := make(map[string]interface{}, len(v))
+		for k, el := range v {
+			lower := strings.ToLower(strings.TrimSpace(k))
+			if rawBodySensitiveKeys[lower] {
+				if s, ok := el.(string); ok && isRedactedPlaceholder(s) {
+					out[k] = el
+					continue
+				}
+				if el == nil {
+					out[k] = nil
+					continue
+				}
+				out[k] = "[REDACTED]"
+				changed = true
+				continue
+			}
+			redEl, c := redactRawJSONValue(el)
+			if c {
+				changed = true
+			}
+			out[k] = redEl
+		}
+		return out, changed
+	case []interface{}:
+		changed := false
+		out := make([]interface{}, len(v))
+		for i, el := range v {
+			redEl, c := redactRawJSONValue(el)
+			if c {
+				changed = true
+			}
+			out[i] = redEl
+		}
+		return out, changed
+	default:
+		return val, false
 	}
 }
 
@@ -327,6 +510,19 @@ func CheckForUnredactedSecrets(c *Cassette) (bool, string) {
 	}
 
 	for _, inter := range c.Interactions {
+		if rawQuery := extractEndpointRawQuery(inter.Request.Endpoint); rawQuery != "" {
+			if vals, qErr := url.ParseQuery(rawQuery); qErr == nil {
+				for qk, qList := range vals {
+					if IsSensitiveQueryParam(qk) {
+						for _, qv := range qList {
+							if !isRedactedPlaceholder(qv) {
+								return true, "unredacted URL query secret parameter detected (?key=***)"
+							}
+						}
+					}
+				}
+			}
+		}
 		for k, v := range inter.Request.Headers {
 			if sensitiveHeaderNames[strings.ToLower(strings.TrimSpace(k))] && !isRedactedPlaceholder(v) {
 				return true, fmt.Sprintf("unredacted sensitive request header %q detected ([***])", k)
@@ -343,17 +539,27 @@ func CheckForUnredactedSecrets(c *Cassette) (bool, string) {
 				return true, fmt.Sprintf("unredacted sensitive interaction metadata %q detected ([***])", k)
 			}
 		}
-		if keyName, found := findUnredactedMapKey(inter.Request.ToolInput); found {
+		if keyName, found := findUnredactedValue(inter.Request.ToolInput, sensitiveKeyNames); found {
 			return true, fmt.Sprintf("unredacted sensitive tool_input field %q detected ([***])", keyName)
 		}
-		if m, ok := inter.Request.Body.(map[string]interface{}); ok {
-			if keyName, found := findUnredactedMapKey(m); found {
-				return true, fmt.Sprintf("unredacted sensitive request body field %q detected ([***])", keyName)
-			}
+		if keyName, found := findUnredactedValue(inter.Request.Matcher.FuzzySignature.NormalizedArgs, sensitiveKeyNames); found {
+			return true, fmt.Sprintf("unredacted sensitive fuzzy_signature.normalized_args field %q detected ([***])", keyName)
 		}
-		if m, ok := inter.Response.Body.(map[string]interface{}); ok {
-			if keyName, found := findUnredactedMapKey(m); found {
-				return true, fmt.Sprintf("unredacted sensitive response body field %q detected ([***])", keyName)
+		if keyName, found := findUnredactedValue(inter.Request.Body, sensitiveKeyNames); found {
+			return true, fmt.Sprintf("unredacted sensitive request body field %q detected ([***])", keyName)
+		}
+		if keyName, found := findUnredactedValue(inter.Response.Body, sensitiveKeyNames); found {
+			return true, fmt.Sprintf("unredacted sensitive response body field %q detected ([***])", keyName)
+		}
+		if keyName, found := findUnredactedRawJSON(inter.Request.RawBody); found {
+			return true, fmt.Sprintf("unredacted sensitive request raw_body field %q detected ([***])", keyName)
+		}
+		if keyName, found := findUnredactedRawJSON(inter.Response.RawBody); found {
+			return true, fmt.Sprintf("unredacted sensitive response raw_body field %q detected ([***])", keyName)
+		}
+		for _, ev := range inter.Response.SSEEvents {
+			if keyName, found := findUnredactedRawJSON(ev.Data); found {
+				return true, fmt.Sprintf("unredacted sensitive sse_events data field %q detected ([***])", keyName)
 			}
 		}
 	}
@@ -361,34 +567,52 @@ func CheckForUnredactedSecrets(c *Cassette) (bool, string) {
 	return false, ""
 }
 
-func findUnredactedMapKey(m map[string]interface{}) (string, bool) {
-	for k, v := range m {
-		lower := strings.ToLower(strings.TrimSpace(k))
-		if sensitiveKeyNames[lower] || sensitiveHeaderNames[lower] {
-			switch s := v.(type) {
-			case string:
-				if !isRedactedPlaceholder(s) {
-					return k, true
+func findUnredactedRawJSON(raw string) (string, bool) {
+	if !hasRawBodySensitiveKey(raw) {
+		return "", false
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return "", false
+	}
+	return findUnredactedValue(parsed, rawBodySensitiveKeys)
+}
+
+func findUnredactedValue(val interface{}, keySet map[string]bool) (string, bool) {
+	switch cur := val.(type) {
+	case map[string]interface{}:
+		for k, v := range cur {
+			lower := strings.ToLower(strings.TrimSpace(k))
+			if keySet[lower] || sensitiveHeaderNames[lower] {
+				switch s := v.(type) {
+				case string:
+					if !isRedactedPlaceholder(s) {
+						return k, true
+					}
+				default:
+					if v != nil {
+						return k, true
+					}
 				}
-			default:
-				if v != nil {
-					return k, true
-				}
+				continue
 			}
-			continue
-		}
-		if nested, ok := v.(map[string]interface{}); ok {
-			if nk, found := findUnredactedMapKey(nested); found {
+			if nk, found := findUnredactedValue(v, keySet); found {
 				return nk, true
 			}
 		}
-		if slice, ok := v.([]interface{}); ok {
-			for _, item := range slice {
-				if nested, ok := item.(map[string]interface{}); ok {
-					if nk, found := findUnredactedMapKey(nested); found {
-						return nk, true
-					}
-				}
+	case map[string]string:
+		for k, v := range cur {
+			lower := strings.ToLower(strings.TrimSpace(k))
+			if (keySet[lower] || sensitiveHeaderNames[lower]) && !isRedactedPlaceholder(v) {
+				return k, true
+			}
+		}
+	case []interface{}:
+		for _, item := range cur {
+			if nk, found := findUnredactedValue(item, keySet); found {
+				return nk, true
 			}
 		}
 	}

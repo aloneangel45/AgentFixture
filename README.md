@@ -277,7 +277,7 @@ version: "agentfixture/v1"
 metadata:
   cassette_id: "cas_anthropic_sse_01"
   recorded_at: "2026-11-10T16:40:00Z"
-  generator: "AgentFixture v1.2.0"
+  generator: "AgentFixture v1.2.1"
   model: "claude-sonnet-4-20250514"
   metrics:
     total_interactions: 1

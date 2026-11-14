@@ -109,3 +109,39 @@ func TestCassette_SerializationYAMLAndJSON(t *testing.T) {
 		t.Fatalf("expected non-empty YAML file, err: %v", err)
 	}
 }
+
+func TestSave_AtomicOverwriteAndNoTempLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	target := filepath.Join(tmpDir, "sub", "atomic.yaml")
+
+	c1 := NewCassette("atomic-v1")
+	c1.Interactions = []Interaction{{ID: "int_1", Sequence: 1, Type: InteractionTypeHTTP}}
+	if err := Save(target, c1); err != nil {
+		t.Fatalf("first Save failed: %v", err)
+	}
+
+	c2 := NewCassette("atomic-v2")
+	c2.Interactions = []Interaction{
+		{ID: "int_1", Sequence: 1, Type: InteractionTypeHTTP},
+		{ID: "int_2", Sequence: 2, Type: InteractionTypeHTTP},
+	}
+	if err := Save(target, c2); err != nil {
+		t.Fatalf("overwrite Save failed: %v", err)
+	}
+
+	loaded, err := Load(target)
+	if err != nil {
+		t.Fatalf("Load after atomic overwrite failed: %v", err)
+	}
+	if loaded.Metadata.CassetteID != "atomic-v2" || len(loaded.Interactions) != 2 {
+		t.Fatalf("unexpected cassette content after overwrite: %+v", loaded.Metadata)
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "atomic.yaml" {
+		t.Fatalf("expected no leftover temporary files in %s, found %d entries", filepath.Dir(target), len(entries))
+	}
+}

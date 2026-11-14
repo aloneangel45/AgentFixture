@@ -25,7 +25,7 @@ import (
 )
 
 // Version is injected at build time via -ldflags="-X main.Version=...".
-var Version = "1.2.0"
+var Version = "1.2.1"
 
 const (
 	ProgramName = "AgentFixture"
@@ -77,9 +77,55 @@ func main() {
 func formatVersionString(ver string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(ver), "v")
 	if clean == "" {
-		clean = "1.2.0"
+		clean = "1.2.1"
 	}
 	return fmt.Sprintf("%s v%s (%s)", ProgramName, clean, Banner)
+}
+
+// permuteFlagsFirst reorders args so flags (and their values) precede positional arguments,
+// allowing idiomatic CLI invocations such as `agentfixture verify fixtures/ -json -junit out.xml`
+// while preserving `--` argument termination.
+func permuteFlagsFirst(fs *flag.FlagSet, args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	flags := make([]string, 0, len(args))
+	positional := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i:]...)
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+			continue
+		}
+		name := strings.TrimPrefix(arg, "-")
+		if strings.HasPrefix(name, "-") {
+			name = name[1:]
+		}
+		if strings.Contains(name, "=") {
+			flags = append(flags, arg)
+			continue
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			flags = append(flags, arg)
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			flags = append(flags, arg)
+			continue
+		}
+		flags = append(flags, arg)
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, positional...)
 }
 
 func printVersion() {
@@ -247,7 +293,7 @@ func handleVerify(args []string) error {
 	strictCheck := flagSet.Bool("strict", true, "Enforce strict schema validation")
 	jsonOut := flagSet.Bool("json", false, "Emit structured JSON verification report")
 	junitPath := flagSet.String("junit", "", "Write JUnit XML verification report to path")
-	if err := flagSet.Parse(args); err != nil {
+	if err := flagSet.Parse(permuteFlagsFirst(flagSet, args)); err != nil {
 		return err
 	}
 
@@ -460,7 +506,7 @@ type inspectReport struct {
 func handleInspect(args []string) error {
 	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "Emit structured JSON telemetry")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
 		return err
 	}
 
@@ -557,7 +603,7 @@ func handleInspect(args []string) error {
 func handleRedact(args []string) error {
 	fs := flag.NewFlagSet("redact", flag.ContinueOnError)
 	outPath := fs.String("out", "", "Destination path (defaults to in-place overwrite)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
 		return err
 	}
 
@@ -583,8 +629,16 @@ func handleRedact(args []string) error {
 		if inter.Request.ToolName != "" {
 			inter.Request.Matcher.FuzzySignature.NormalizedToolName = strings.ToLower(inter.Request.ToolName)
 			inter.Request.Matcher.FuzzySignature.NormalizedArgs = cassette.RedactMap(inter.Request.ToolInput)
-		} else if inter.Request.RawBody != "" && inter.Request.Matcher.FuzzySignature.NormalizedPrompt != "" {
-			inter.Request.Matcher.FuzzySignature.NormalizedPrompt = matcher.NormalizeText(inter.Request.RawBody)
+		} else {
+			prompt, model := matcher.ExtractPromptAndModel(&inter.Request)
+			if prompt != "" {
+				inter.Request.Matcher.FuzzySignature.NormalizedPrompt = prompt
+			} else if inter.Request.Matcher.FuzzySignature.NormalizedPrompt != "" {
+				inter.Request.Matcher.FuzzySignature.NormalizedPrompt = matcher.NormalizeText(inter.Request.Matcher.FuzzySignature.NormalizedPrompt)
+			}
+			if model != "" && inter.Request.Matcher.FuzzySignature.Model == "" {
+				inter.Request.Matcher.FuzzySignature.Model = model
+			}
 		}
 	}
 
@@ -604,7 +658,7 @@ func handleImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	tpPath := fs.String("traceport", "", "Path to TracePort flight recording JSON file")
 	outPath := fs.String("out", "cassette.yaml", "Output path for the generated cassette file")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
 		return err
 	}
 
@@ -628,7 +682,7 @@ func handleImport(args []string) error {
 func handleDiff(args []string) error {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	exitCode := fs.Bool("exit-code", false, "Exit with non-zero status code when differences are found")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
 		return err
 	}
 
@@ -685,8 +739,11 @@ func handleDiff(args []string) error {
 				fmt.Printf("    - %s\n", d)
 			}
 		} else if i1.Response.StatusCode != i2.Response.StatusCode ||
+			i1.Response.Error != i2.Response.Error ||
 			(len(i1.Response.SSEEvents) == 0 && len(i2.Response.SSEEvents) == 0 &&
-				(i1.Response.RawBody != i2.Response.RawBody || i1.Response.ToolResult != i2.Response.ToolResult)) {
+				(i1.Response.RawBody != i2.Response.RawBody ||
+					i1.Response.ToolResult != i2.Response.ToolResult ||
+					!canonicalBodyEqual(i1.Response.Body, i2.Response.Body))) {
 			diffFound = true
 			fmt.Printf("\n[WARN] Interaction #%d Response Drift (status %d vs %d)\n",
 				i+1, i1.Response.StatusCode, i2.Response.StatusCode)
@@ -762,6 +819,21 @@ func diffSSEResponses(i1, i2 *cassette.Interaction) []string {
 	return diffs
 }
 
+func canonicalBodyEqual(a, b interface{}) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	ca, err1 := matcher.CanonicalJSON(a)
+	cb, err2 := matcher.CanonicalJSON(b)
+	if err1 != nil || err2 != nil {
+		return reflect.DeepEqual(a, b)
+	}
+	return string(ca) == string(cb)
+}
+
 func splitDashArgs(args []string) (flagArgs []string, cmdArgs []string) {
 	for i, arg := range args {
 		if arg == "--" {
@@ -779,7 +851,7 @@ func handleRecord(args []string) error {
 	mcpMode := fs.Bool("mcp", false, "Record an MCP stdio server subprocess instead of an HTTP proxy")
 
 	flagArgs, cmdArgs := splitDashArgs(args)
-	if err := fs.Parse(flagArgs); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
 		return err
 	}
 
@@ -870,7 +942,7 @@ func handleReplay(args []string) error {
 	junitPath := fs.String("junit", "", "Write JUnit XML regression report to path")
 
 	flagArgs, cmdArgs := splitDashArgs(args)
-	if err := fs.Parse(flagArgs); err != nil {
+	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
 		return err
 	}
 

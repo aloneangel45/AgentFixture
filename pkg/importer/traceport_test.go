@@ -241,3 +241,48 @@ func TestImportTracePortFile_SplitV11MetaAndJSONL(t *testing.T) {
 		}
 	}
 }
+
+func TestImportTracePortSession_V12TagsDuplicateFrameIndexAndClockSkew(t *testing.T) {
+	// Simulates TracePort v1.2 session with top-level tags (including a sensitive tag),
+	// frames missing/duplicating `index` (both 0), and slight negative NTP clock skew on output frame.
+	sessionJSON := `{
+		"id": "tp_v12_tags_dup_idx",
+		"command": "agent run",
+		"start_time": "2026-11-14T10:00:00Z",
+		"status": "completed",
+		"tags": {
+			"env": "staging",
+			"branch": "feat/gemini",
+			"api_key": "raw-tag-secret-must-be-scrubbed"
+		},
+		"frames": [
+			{"index": 0, "timestamp": "2026-11-14T10:00:05Z", "type": "input", "content": "Hello", "git_snapshot": "zstd:snap_turn_1"},
+			{"index": 0, "timestamp": "2026-11-14T10:00:04Z", "type": "output", "content": "Hi there"},
+			{"index": 0, "timestamp": "2026-11-14T10:00:06Z", "type": "input", "content": "Second turn"},
+			{"index": 0, "timestamp": "2026-11-14T10:00:07Z", "type": "output", "content": "Second reply"}
+		]
+	}`
+
+	cas, err := ImportTracePortSession([]byte(sessionJSON))
+	if err != nil {
+		t.Fatalf("ImportTracePortSession failed: %v", err)
+	}
+	if err := cas.Validate(); err != nil {
+		t.Fatalf("expected imported cassette with duplicate frame.Index=0 to pass Validate(), got: %v", err)
+	}
+	if cas.Metadata.Tags["env"] != "staging" || cas.Metadata.Tags["branch"] != "feat/gemini" {
+		t.Errorf("expected TracePort v1.2 session tags preserved, got: %+v", cas.Metadata.Tags)
+	}
+	if cas.Metadata.Tags["api_key"] != "[REDACTED]" {
+		t.Errorf("expected sensitive session tag 'api_key' scrubbed to [REDACTED], got %q", cas.Metadata.Tags["api_key"])
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(cas); hasSec {
+		t.Fatalf("unexpected secret leak in imported v1.2 session: %s", reason)
+	}
+	if cas.Interactions[0].Response.LatencyMs < 0 {
+		t.Errorf("expected negative clock-skew latency clamped to >= 0, got %d", cas.Interactions[0].Response.LatencyMs)
+	}
+	if cas.Interactions[0].Metadata["git_snapshot"] != "zstd:snap_turn_1" {
+		t.Errorf("expected turn git_snapshot preserved, got %q", cas.Interactions[0].Metadata["git_snapshot"])
+	}
+}

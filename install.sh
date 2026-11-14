@@ -2,7 +2,7 @@
 # AgentFixture Universal POSIX/Bash One-Line Installer (Linux & macOS amd64/arm64)
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
-#   AGENTFIXTURE_VERSION=v1.2.0 curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
+#   AGENTFIXTURE_VERSION=v1.2.1 curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
 
 set -eu
 
@@ -119,7 +119,9 @@ resolve_install_dir() {
     printf '%s' "$AGENTFIXTURE_INSTALL_DIR"
     return
   fi
-  if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+  if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
+    printf '/usr/local/bin'
+  elif command -v sudo >/dev/null 2>&1 && (sudo -n true >/dev/null 2>&1 || [ -c /dev/tty ]); then
     printf '/usr/local/bin'
   else
     printf '%s/.local/bin' "$HOME"

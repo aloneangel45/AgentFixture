@@ -156,6 +156,17 @@ func NormalizeEndpoint(raw string) string {
 
 	if rawQuery != "" {
 		if vals, err := url.ParseQuery(rawQuery); err == nil {
+			for k, list := range vals {
+				if cassette.IsSensitiveQueryParam(k) {
+					vals.Set(k, "[REDACTED]")
+					continue
+				}
+				for i, item := range list {
+					if strings.TrimSpace(item) != "" && cassette.IsRedactedPlaceholder(item) {
+						list[i] = "[REDACTED]"
+					}
+				}
+			}
 			encoded := vals.Encode()
 			if encoded != "" {
 				return pathPart + "?" + encoded

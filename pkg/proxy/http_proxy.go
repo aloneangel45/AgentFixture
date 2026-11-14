@@ -270,8 +270,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var jsonBody interface{}
-	if len(bodyBytes) > 0 && strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "json") {
-		if parsed, decErr := matcher.DecodeJSONUseNumber(bodyBytes); decErr == nil {
+	trimmedReq := bytes.TrimSpace(bodyBytes)
+	if len(trimmedReq) > 0 && (strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "json") || trimmedReq[0] == '{' || trimmedReq[0] == '[') {
+		if parsed, decErr := matcher.DecodeJSONUseNumber(trimmedReq); decErr == nil {
 			jsonBody = parsed
 		}
 	}
@@ -354,13 +355,19 @@ func (s *Server) selectMatchLocked(candidate *cassette.Request) (*cassette.Inter
 }
 
 func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate *cassette.Request) {
+	redactedCandidate := candidate.Clone()
+	cassette.RedactRequest(&redactedCandidate)
+	redactedCandidate.Matcher.StrictHash = matcher.ComputeRequestHash(&redactedCandidate)
+
 	s.mu.Lock()
-	bestInter, bestScore, lastDiff := s.selectMatchLocked(candidate)
+	bestInter, bestScore, lastDiff := s.selectMatchLocked(&redactedCandidate)
+	if bestInter == nil && redactedCandidate.Matcher.StrictHash != candidate.Matcher.StrictHash {
+		// Fallback for programmatic in-memory test cassettes constructed without RedactRequest.
+		bestInter, bestScore, lastDiff = s.selectMatchLocked(candidate)
+	}
 
 	if bestInter == nil {
-		missed := candidate.Clone()
-		cassette.RedactRequest(&missed)
-		s.unmatched = append(s.unmatched, missed)
+		s.unmatched = append(s.unmatched, redactedCandidate)
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -369,9 +376,9 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate 
 
 		resp := map[string]interface{}{
 			"error":              "AgentFixture replay mismatch: no recorded interaction matched request",
-			"candidate_method":   missed.Method,
-			"candidate_endpoint": missed.Endpoint,
-			"diff_explanation":   lastDiff,
+			"candidate_method":   redactedCandidate.Method,
+			"candidate_endpoint": redactedCandidate.Endpoint,
+			"diff_explanation":   cassette.RedactString(lastDiff),
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 		return
@@ -480,13 +487,13 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 	start := time.Now()
 	resp, err := s.upstreamClient.Do(outReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Upstream request failed: %v", err), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("Upstream request failed: %s", cassette.RedactString(err.Error())), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	var bodyReader io.Reader = resp.Body
-	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
 		gzReader, gzErr := gzip.NewReader(resp.Body)
 		if gzErr != nil {
 			http.Error(w, fmt.Sprintf("Failed to initialize upstream gzip reader: %v", gzErr), http.StatusBadGateway)
@@ -550,6 +557,17 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		storedReq := candidate.Clone()
 		cassette.RedactRequest(&storedReq)
 		storedReq.Matcher.StrictHash = matcher.ComputeRequestHash(&storedReq)
+		normPrompt, reqModel := matcher.ExtractPromptAndModel(&storedReq)
+		if normPrompt != "" {
+			storedReq.Matcher.FuzzySignature.NormalizedPrompt = normPrompt
+		}
+		resolvedModel := summary.Model
+		if resolvedModel == "" {
+			resolvedModel = reqModel
+		}
+		if resolvedModel != "" {
+			storedReq.Matcher.FuzzySignature.Model = resolvedModel
+		}
 
 		inter := cassette.Interaction{
 			Type:    cassette.InteractionTypeSSE,
@@ -569,8 +587,8 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		seq := len(s.cassette.Interactions) + 1
 		inter.ID = fmt.Sprintf("int_%03d", seq)
 		inter.Sequence = seq
-		if s.cassette.Metadata.Model == "" && summary.Model != "" {
-			s.cassette.Metadata.Model = summary.Model
+		if s.cassette.Metadata.Model == "" && resolvedModel != "" {
+			s.cassette.Metadata.Model = resolvedModel
 		}
 		s.cassette.Interactions = append(s.cassette.Interactions, inter)
 		s.mu.Unlock()
@@ -587,8 +605,9 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 	var respJSON interface{}
 	var usage cassette.Usage
 	var detectedModel string
-	if strings.Contains(contentType, "json") && len(respBody) > 0 {
-		if parsed, decErr := matcher.DecodeJSONUseNumber(respBody); decErr == nil {
+	trimmedResp := bytes.TrimSpace(respBody)
+	if len(trimmedResp) > 0 && (strings.Contains(contentType, "json") || trimmedResp[0] == '{' || trimmedResp[0] == '[') {
+		if parsed, decErr := matcher.DecodeJSONUseNumber(trimmedResp); decErr == nil {
 			respJSON = parsed
 			usage = cassette.ExtractUsageFromBody(parsed)
 			detectedModel = cassette.ExtractModelFromBody(parsed)
@@ -598,6 +617,16 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 	storedReq := candidate.Clone()
 	cassette.RedactRequest(&storedReq)
 	storedReq.Matcher.StrictHash = matcher.ComputeRequestHash(&storedReq)
+	normPrompt, reqModel := matcher.ExtractPromptAndModel(&storedReq)
+	if normPrompt != "" {
+		storedReq.Matcher.FuzzySignature.NormalizedPrompt = normPrompt
+	}
+	if detectedModel == "" {
+		detectedModel = reqModel
+	}
+	if detectedModel != "" {
+		storedReq.Matcher.FuzzySignature.Model = detectedModel
+	}
 
 	inter := cassette.Interaction{
 		Type:    cassette.InteractionTypeHTTP,

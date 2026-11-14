@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -301,5 +302,150 @@ func TestStdioReplayer_ContentLengthNotificationsSynthesisAndRecorder(t *testing
 	}
 	if !strings.Contains(outStr, `\"quoted\"`) {
 		t.Errorf("expected properly JSON-escaped quotes in fallback error output, got: %s", outStr)
+	}
+}
+
+func TestHTTPProxy_RecordGeminiQueryKeyAndReplayWithDummySecrets(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != "AIzaSyLiveSecretKey1234567890123456789" {
+			http.Error(w, "missing live upstream key", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Gemini OK\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":4,\"totalTokenCount\":16},\"modelVersion\":\"gemini-2.5-flash\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	recCas := cassette.NewCassette("cas_gem_proxy")
+	recSrv, err := NewServer(Config{
+		Mode:        ModeRecord,
+		UpstreamURL: upstream.URL,
+		Cassette:    recCas,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recSrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	reqBody := `{"contents":[{"role":"user","parts":[{"text":"Ping Gemini"}]}],"api_key":"live-inline-secret"}`
+	liveResp, err := http.Post(
+		recSrv.URL()+"/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=AIzaSyLiveSecretKey1234567890123456789",
+		"application/json",
+		strings.NewReader(reqBody),
+	)
+	if err != nil {
+		_ = recSrv.Close()
+		t.Fatalf("live record request failed: %v", err)
+	}
+	_, _ = io.ReadAll(liveResp.Body)
+	_ = liveResp.Body.Close()
+	_ = recSrv.Close()
+
+	savedCas := recSrv.GetCassette()
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(savedCas); hasSec {
+		t.Fatalf("unredacted secret in recorded Gemini cassette: %s", reason)
+	}
+	if len(savedCas.Interactions) != 1 {
+		t.Fatalf("expected 1 recorded interaction, got %d", len(savedCas.Interactions))
+	}
+	sig := savedCas.Interactions[0].Request.Matcher.FuzzySignature
+	if sig.NormalizedPrompt != "user: Ping Gemini" || sig.Model != "gemini-2.5-flash" {
+		t.Errorf("expected FuzzySignature populated (prompt='user: Ping Gemini', model='gemini-2.5-flash'), got %+v", sig)
+	}
+
+	// Replay with StrictMatcher using completely different CI dummy ?key= AND different inline api_key!
+	replaySrv, err := NewServer(Config{
+		Mode:     ModeReplay,
+		Cassette: savedCas,
+		Matcher:  matcher.NewStrictMatcher(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaySrv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer replaySrv.Close()
+
+	ciBody := `{"contents":[{"role":"user","parts":[{"text":"Ping Gemini"}]}],"api_key":"ci-dummy-offline-secret"}`
+	repResp, err := http.Post(
+		replaySrv.URL()+"/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=af-offline-replay-key",
+		"application/json",
+		strings.NewReader(ciBody),
+	)
+	if err != nil {
+		t.Fatalf("replay request failed: %v", err)
+	}
+	repBytes, _ := io.ReadAll(repResp.Body)
+	_ = repResp.Body.Close()
+	if repResp.StatusCode != http.StatusOK || !strings.Contains(string(repBytes), "Gemini OK") {
+		t.Fatalf("expected 200 OK Gemini SSE replay with dummy CI keys, got status=%d body=%s", repResp.StatusCode, string(repBytes))
+	}
+}
+
+func TestStdioProxy_MIMEHeaderOrder64BitIDMCPIsErrorAndTruncatedEOF(t *testing.T) {
+	// 1. Record MCP tool call with Content-Type BEFORE Content-Length, 64-bit ID (2^53 + 1), and isError: true response
+	rec := NewStdioRecorder(cassette.NewCassette("mcp_edge_cases"))
+	serverInR, serverInW := io.Pipe()
+	serverOutR, serverOutW := io.Pipe()
+
+	const bigID = "9007199254740993"
+	reqJSON := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"run_sql","arguments":{"sql":"DROP TABLE prod"}}}`, bigID)
+	// Put Content-Type header BEFORE Content-Length header!
+	framedReq := fmt.Sprintf("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(reqJSON), reqJSON)
+	respJSON := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"permission denied: read-only role"}],"isError":true}}`, bigID)
+	framedResp := fmt.Sprintf("Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(respJSON), respJSON)
+
+	go func() {
+		defer serverOutW.Close()
+		buf := make([]byte, len(framedReq))
+		_, _ = io.ReadFull(serverInR, buf)
+		_, _ = io.WriteString(serverOutW, framedResp)
+	}()
+
+	var liveOut bytes.Buffer
+	recCas, err := rec.RecordStreams(strings.NewReader(framedReq), serverInW, serverOutR, &liveOut)
+	if err != nil {
+		t.Fatalf("RecordStreams failed with Content-Type before Content-Length: %v", err)
+	}
+	if len(recCas.Interactions) != 1 {
+		t.Fatalf("expected 1 recorded interaction matched across 64-bit ID %s, got %d", bigID, len(recCas.Interactions))
+	}
+
+	// Save & reload from YAML to ensure full round-trip fidelity of MCP isError: true
+	casFile := filepath.Join(t.TempDir(), "mcp_is_error.yaml")
+	if err := cassette.Save(casFile, recCas); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	loadedCas, err := cassette.Load(casFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	replayer := NewStdioReplayer(loadedCas, matcher.NewStrictMatcher())
+	var replayOut bytes.Buffer
+	if err := replayer.ProcessStream(strings.NewReader(framedReq), &replayOut); err != nil {
+		t.Fatalf("StdioReplayer.ProcessStream failed: %v", err)
+	}
+	replayStr := replayOut.String()
+	if !strings.Contains(replayStr, bigID) {
+		t.Errorf("expected exact 64-bit JSON-RPC id %s preserved in replay output, got: %s", bigID, replayStr)
+	}
+	if !strings.Contains(replayStr, `"isError":true`) {
+		t.Errorf("expected MCP isError:true preserved in replay output, got: %s", replayStr)
+	}
+	if replayer.MatchedCount() != 1 {
+		t.Errorf("expected MatchedCount() == 1, got %d", replayer.MatchedCount())
+	}
+
+	// 2. Truncated Content-Length frame MUST return io.ErrUnexpectedEOF (not nil!)
+	truncated := "Content-Length: 200\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1"
+	var truncOut bytes.Buffer
+	errTrunc := replayer.ProcessStream(strings.NewReader(truncated), &truncOut)
+	if !errors.Is(errTrunc, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected io.ErrUnexpectedEOF on truncated Content-Length frame, got: %v", errTrunc)
 	}
 }

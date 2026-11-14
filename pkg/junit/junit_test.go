@@ -139,3 +139,42 @@ func TestBuildReplaySuites_PassFailAndSkippedAssertions(t *testing.T) {
 		t.Errorf("expected tests=4 failures=3 after XML round-trip, got tests=%d failures=%d", roundTrip.Tests, roundTrip.Failures)
 	}
 }
+
+func TestWriteFile_AtomicOverwriteAndNoTempLeak(t *testing.T) {
+	tmpDir := t.TempDir()
+	outPath := filepath.Join(tmpDir, "nested", "junit-report.xml")
+
+	s1 := BuildVerifySuites("fixtures/a.yaml", []VerifyCaseInput{
+		{Path: "fixtures/a.yaml", CassetteID: "cas_a", Valid: true, Interactions: 1},
+	}, 10, 0.001, 5*time.Millisecond)
+	if err := WriteFile(outPath, s1); err != nil {
+		t.Fatalf("initial WriteFile failed: %v", err)
+	}
+
+	s2 := BuildVerifySuites("fixtures/b.yaml", []VerifyCaseInput{
+		{Path: "fixtures/b.yaml", CassetteID: "cas_b", Valid: false, ErrorType: "SecurityViolation", Error: "unredacted key"},
+	}, 0, 0, 8*time.Millisecond)
+	if err := WriteFile(outPath, s2); err != nil {
+		t.Fatalf("atomic overwrite WriteFile failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("failed reading overwritten junit file: %v", err)
+	}
+	var parsed TestSuites
+	if err := xml.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("overwritten junit XML invalid: %v", err)
+	}
+	if parsed.Failures != 1 {
+		t.Errorf("expected overwritten junit report to have failures=1, got %d", parsed.Failures)
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(outPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "junit-report.xml" {
+		t.Fatalf("expected zero leftover temp files alongside junit-report.xml, got entries: %v", entries)
+	}
+}

@@ -67,7 +67,7 @@ func (f *FuzzyMatcher) Match(expected, actual *cassette.Request) MatchResult {
 	}
 
 	// 1. Tool execution comparison
-	if expected.ToolName != "" || actual.ToolName != "" {
+	if expected.ToolName != "" || actual.ToolName != "" || expected.Matcher.FuzzySignature.NormalizedToolName != "" {
 		return f.matchTool(expected, actual)
 	}
 
@@ -76,19 +76,37 @@ func (f *FuzzyMatcher) Match(expected, actual *cassette.Request) MatchResult {
 }
 
 func (f *FuzzyMatcher) matchTool(expected, actual *cassette.Request) MatchResult {
-	expName := strings.ToLower(strings.TrimSpace(expected.ToolName))
-	actName := strings.ToLower(strings.TrimSpace(actual.ToolName))
+	rawExpName := expected.ToolName
+	if rawExpName == "" {
+		rawExpName = expected.Matcher.FuzzySignature.NormalizedToolName
+	}
+	rawActName := actual.ToolName
+	if rawActName == "" {
+		rawActName = actual.Matcher.FuzzySignature.NormalizedToolName
+	}
+
+	expName := strings.ToLower(strings.TrimSpace(rawExpName))
+	actName := strings.ToLower(strings.TrimSpace(rawActName))
 
 	if expName != actName {
 		return MatchResult{
 			Matched: false,
 			Score:   0.0,
-			Diff:    fmt.Sprintf("tool name mismatch: expected %q, got %q", expected.ToolName, actual.ToolName),
+			Diff:    fmt.Sprintf("tool name mismatch: expected %q, got %q", rawExpName, rawActName),
 		}
 	}
 
-	expArgs := filterDynamicKeys(cassette.RedactMap(expected.ToolInput))
-	actArgs := filterDynamicKeys(cassette.RedactMap(actual.ToolInput))
+	rawExpArgs := expected.ToolInput
+	if len(rawExpArgs) == 0 && len(expected.Matcher.FuzzySignature.NormalizedArgs) > 0 {
+		rawExpArgs = expected.Matcher.FuzzySignature.NormalizedArgs
+	}
+	rawActArgs := actual.ToolInput
+	if len(rawActArgs) == 0 && len(actual.Matcher.FuzzySignature.NormalizedArgs) > 0 {
+		rawActArgs = actual.Matcher.FuzzySignature.NormalizedArgs
+	}
+
+	expArgs := filterDynamicKeys(cassette.RedactMap(rawExpArgs))
+	actArgs := filterDynamicKeys(cassette.RedactMap(rawActArgs))
 
 	if reflect.DeepEqual(expArgs, actArgs) {
 		return MatchResult{Matched: true, Score: 1.0}
@@ -104,7 +122,10 @@ func (f *FuzzyMatcher) matchTool(expected, actual *cassette.Request) MatchResult
 }
 
 func (f *FuzzyMatcher) matchHTTP(expected, actual *cassette.Request) MatchResult {
-	if !strings.EqualFold(expected.Method, actual.Method) {
+	sigOnlyExpected := strings.TrimSpace(expected.RawBody) == "" && expected.Body == nil &&
+		strings.TrimSpace(expected.Matcher.FuzzySignature.NormalizedPrompt) != ""
+
+	if !(sigOnlyExpected && expected.Method == "") && !strings.EqualFold(expected.Method, actual.Method) {
 		return MatchResult{
 			Matched: false,
 			Score:   0.0,
@@ -114,12 +135,31 @@ func (f *FuzzyMatcher) matchHTTP(expected, actual *cassette.Request) MatchResult
 
 	expPath := normalizeEndpoint(expected.Endpoint)
 	actPath := normalizeEndpoint(actual.Endpoint)
-	if expPath != actPath {
+	if !(sigOnlyExpected && expPath == "") && expPath != actPath {
 		return MatchResult{
 			Matched: false,
 			Score:   0.0,
 			Diff:    fmt.Sprintf("endpoint mismatch: expected %s, got %s", expPath, actPath),
 		}
+	}
+
+	// Signature-only cassette fallback when RawBody and Body were omitted/scrubbed
+	if sigOnlyExpected {
+		expSig := NormalizeText(cassette.RedactString(expected.Matcher.FuzzySignature.NormalizedPrompt))
+		actPrompt, _ := ExtractPromptAndModel(actual)
+		if actPrompt == "" {
+			actPrompt = NormalizeText(cassette.RedactString(actual.RawBody))
+		}
+		if expSig == actPrompt {
+			return MatchResult{Matched: true, Score: 1.0}
+		}
+		score := StringSimilarity(expSig, actPrompt)
+		matched := score >= f.Threshold
+		var diff string
+		if !matched {
+			diff = fmt.Sprintf("semantic prompt signature similarity %.2f below threshold %.2f", score, f.Threshold)
+		}
+		return MatchResult{Matched: matched, Score: score, Diff: diff}
 	}
 
 	// Attempt structured JSON normalization first (strips dynamic keys, normalizes strings, ignores key order)
@@ -134,7 +174,20 @@ func (f *FuzzyMatcher) matchHTTP(expected, actual *cassette.Request) MatchResult
 			if bytes.Equal(cbExp, cbAct) {
 				return MatchResult{Matched: true, Score: 1.0}
 			}
-			score := StringSimilarity(string(cbExp), string(cbAct))
+			jsonSim := StringSimilarity(string(cbExp), string(cbAct))
+			score := jsonSim
+
+			// For LLM provider payloads (Google Gemini contents/systemInstruction, Anthropic messages/system,
+			// OpenAI messages/input/prompt), weight normalized conversation prompt similarity so volatile
+			// sampling config (temperature/generationConfig) does not reject identical prompts AND shared
+			// large tool schemas cannot mask completely unrelated user prompts.
+			if expConv, ok1 := extractConversationPrompt(fExp); ok1 {
+				if actConv, ok2 := extractConversationPrompt(fAct); ok2 {
+					promptSim := StringSimilarity(expConv, actConv)
+					score = 0.90*promptSim + 0.10*jsonSim
+				}
+			}
+
 			matched := score >= f.Threshold
 			var diff string
 			if !matched {
@@ -358,7 +411,7 @@ func normalizeEndpoint(endpoint string) string {
 		return strings.ToLower(norm)
 	}
 	for k := range vals {
-		if dynamicKeys[strings.ToLower(k)] {
+		if dynamicKeys[strings.ToLower(k)] || cassette.IsSensitiveQueryParam(k) {
 			vals.Del(k)
 		}
 	}
@@ -367,6 +420,264 @@ func normalizeEndpoint(endpoint string) string {
 		return pathPart
 	}
 	return pathPart + "?" + strings.ToLower(encoded)
+}
+
+// ExtractPromptAndModel extracts a normalized, secret-redacted LLM conversation prompt
+// and target model name from Google Gemini (contents / systemInstruction / URL /models/<model>),
+// Anthropic (system + messages), OpenAI (messages / input / prompt), or plain-text requests.
+func ExtractPromptAndModel(req *cassette.Request) (string, string) {
+	if req == nil {
+		return "", ""
+	}
+	model := extractGeminiEndpointModel(req.Endpoint)
+
+	if parsed, ok := extractStructuredJSON(req); ok {
+		cleaned := filterDynamicValue(cassette.RedactValue(parsed))
+		if m, isMap := cleaned.(map[string]interface{}); isMap {
+			if mStr, ok := m["model"].(string); ok && strings.TrimSpace(mStr) != "" {
+				model = strings.TrimSpace(mStr)
+			}
+		}
+		if conv, hasConv := extractConversationPrompt(cleaned); hasConv {
+			return conv, model
+		}
+		return "", model
+	}
+
+	raw := strings.TrimSpace(req.RawBody)
+	if raw != "" {
+		return NormalizeText(cassette.RedactString(raw)), model
+	}
+	return "", model
+}
+
+func extractGeminiEndpointModel(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	path := endpoint
+	if qIdx := strings.IndexByte(path, '?'); qIdx != -1 {
+		path = path[:qIdx]
+	}
+	const marker = "/models/"
+	idx := strings.Index(strings.ToLower(path), marker)
+	if idx == -1 {
+		return ""
+	}
+	rest := path[idx+len(marker):]
+	if end := strings.IndexAny(rest, ":/"); end != -1 {
+		rest = rest[:end]
+	}
+	return strings.TrimSpace(rest)
+}
+
+func extractConversationPrompt(parsed interface{}) (string, bool) {
+	m, ok := parsed.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+
+	var segments []string
+
+	// 1. Google Gemini systemInstruction / system_instruction + contents
+	if sysInst, exists := m["systemInstruction"]; exists {
+		if txt := extractGeminiContentItemText(sysInst, "system"); txt != "" {
+			segments = append(segments, txt)
+		}
+	} else if sysInstSnake, exists := m["system_instruction"]; exists {
+		if txt := extractGeminiContentItemText(sysInstSnake, "system"); txt != "" {
+			segments = append(segments, txt)
+		}
+	}
+
+	if contents, exists := m["contents"]; exists {
+		switch cVal := contents.(type) {
+		case []interface{}:
+			for _, item := range cVal {
+				if txt := extractGeminiContentItemText(item, "user"); txt != "" {
+					segments = append(segments, txt)
+				}
+			}
+		case map[string]interface{}:
+			if txt := extractGeminiContentItemText(cVal, "user"); txt != "" {
+				segments = append(segments, txt)
+			}
+		case string:
+			if cVal != "" {
+				segments = append(segments, "user: "+cVal)
+			}
+		}
+		if len(segments) > 0 {
+			return NormalizeText(strings.Join(segments, "\n")), true
+		}
+	}
+
+	// 2. Anthropic top-level system / OpenAI Responses instructions
+	if sysVal, exists := m["system"]; exists {
+		if sysText := extractMessageContentBlocks(sysVal); sysText != "" {
+			segments = append(segments, "system: "+sysText)
+		}
+	}
+	if instVal, ok := m["instructions"].(string); ok && instVal != "" {
+		segments = append(segments, "system: "+instVal)
+	}
+
+	// 3. OpenAI & Anthropic messages array
+	if msgs, ok := m["messages"].([]interface{}); ok {
+		for _, item := range msgs {
+			msgMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			role, _ := msgMap["role"].(string)
+			if role == "" {
+				role = "user"
+			}
+			body := extractMessageContentBlocks(msgMap["content"])
+			if tcs, ok := msgMap["tool_calls"].([]interface{}); ok && len(tcs) > 0 {
+				if cb, err := CanonicalJSON(tcs); err == nil {
+					if body != "" {
+						body += " " + string(cb)
+					} else {
+						body = string(cb)
+					}
+				}
+			}
+			if body != "" {
+				segments = append(segments, role+": "+body)
+			}
+		}
+		if len(segments) > 0 {
+			return NormalizeText(strings.Join(segments, "\n")), true
+		}
+	}
+
+	// 4. OpenAI Responses API "input" (when "model" is present)
+	if _, hasModel := m["model"]; hasModel {
+		if inp, exists := m["input"]; exists {
+			switch iv := inp.(type) {
+			case string:
+				if iv != "" {
+					segments = append(segments, "user: "+iv)
+				}
+			case []interface{}:
+				for _, item := range iv {
+					if itemMap, ok := item.(map[string]interface{}); ok {
+						role, _ := itemMap["role"].(string)
+						if role == "" {
+							role = "user"
+						}
+						if body := extractMessageContentBlocks(itemMap["content"]); body != "" {
+							segments = append(segments, role+": "+body)
+						}
+					} else if s, ok := item.(string); ok && s != "" {
+						segments = append(segments, "user: "+s)
+					}
+				}
+			}
+			if len(segments) > 0 {
+				return NormalizeText(strings.Join(segments, "\n")), true
+			}
+		}
+	}
+
+	// 5. Direct "prompt" field
+	if pStr, ok := m["prompt"].(string); ok && pStr != "" {
+		segments = append(segments, pStr)
+		return NormalizeText(strings.Join(segments, "\n")), true
+	}
+
+	return "", false
+}
+
+func extractGeminiContentItemText(item interface{}, defaultRole string) string {
+	cm, ok := item.(map[string]interface{})
+	if !ok {
+		if s, ok := item.(string); ok && s != "" {
+			return defaultRole + ": " + s
+		}
+		return ""
+	}
+	role, _ := cm["role"].(string)
+	if role == "" {
+		role = defaultRole
+	}
+	var partTexts []string
+	appendPart := func(pMap map[string]interface{}) {
+		if txt, ok := pMap["text"].(string); ok && txt != "" {
+			partTexts = append(partTexts, txt)
+		}
+		if fc, ok := pMap["functionCall"].(map[string]interface{}); ok {
+			if cb, err := CanonicalJSON(fc); err == nil {
+				partTexts = append(partTexts, "functionCall:"+string(cb))
+			}
+		}
+		if fr, ok := pMap["functionResponse"].(map[string]interface{}); ok {
+			if cb, err := CanonicalJSON(fr); err == nil {
+				partTexts = append(partTexts, "functionResponse:"+string(cb))
+			}
+		}
+	}
+
+	switch parts := cm["parts"].(type) {
+	case []interface{}:
+		for _, pItem := range parts {
+			if pMap, ok := pItem.(map[string]interface{}); ok {
+				appendPart(pMap)
+			} else if s, ok := pItem.(string); ok && s != "" {
+				partTexts = append(partTexts, s)
+			}
+		}
+	case map[string]interface{}:
+		appendPart(parts)
+	}
+	if txt, ok := cm["text"].(string); ok && txt != "" && len(partTexts) == 0 {
+		partTexts = append(partTexts, txt)
+	}
+	if len(partTexts) == 0 {
+		return ""
+	}
+	return role + ": " + strings.Join(partTexts, " ")
+}
+
+func extractMessageContentBlocks(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var parts []string
+		for _, el := range c {
+			switch b := el.(type) {
+			case string:
+				if b != "" {
+					parts = append(parts, b)
+				}
+			case map[string]interface{}:
+				bType, _ := b["type"].(string)
+				switch bType {
+				case "tool_use":
+					name, _ := b["name"].(string)
+					cb, _ := CanonicalJSON(b["input"])
+					parts = append(parts, "tool_use:"+name+":"+string(cb))
+				case "tool_result":
+					inner := extractMessageContentBlocks(b["content"])
+					parts = append(parts, "tool_result:"+inner)
+				default:
+					if txt, ok := b["text"].(string); ok && txt != "" {
+						parts = append(parts, txt)
+					} else if inpTxt, ok := b["input_text"].(string); ok && inpTxt != "" {
+						parts = append(parts, inpTxt)
+					}
+				}
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]interface{}:
+		if txt, ok := c["text"].(string); ok {
+			return txt
+		}
+	}
+	return ""
 }
 
 func filterDynamicKeys(m map[string]interface{}) map[string]interface{} {
