@@ -5,6 +5,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -192,21 +195,23 @@ func TestTestReport_FormatSummary_RegressionDetected(t *testing.T) {
 }
 
 func TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang(t *testing.T) {
-	if os.Getenv("AGENTFIXTURE_RUNNER_HANG_ROLE") == "grandchild" {
-		time.Sleep(12 * time.Second)
-		os.Exit(0)
-	}
 	if os.Getenv("AGENTFIXTURE_RUNNER_HANG_ROLE") == "child" {
-		exe, err := os.Executable()
-		if err == nil {
-			gc := exec.Command(exe, "-test.run=^TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang$")
-			gc.Env = append(os.Environ(), "AGENTFIXTURE_RUNNER_HANG_ROLE=grandchild")
-			// Inherit stdout & stderr pipes so grandchild keeps them open after child is killed!
-			gc.Stdout = os.Stdout
-			gc.Stderr = os.Stderr
-			_ = gc.Start()
+		// Spawn an external OS command (not runner.test.exe, which Windows locks in go-build temp dir)
+		// that inherits stdout/stderr pipes and outlives the parent process when killed on timeout.
+		var gc *exec.Cmd
+		if runtime.GOOS == "windows" {
+			gc = exec.Command("ping", "-n", "15", "127.0.0.1")
+		} else {
+			gc = exec.Command("sleep", "15")
 		}
-		time.Sleep(12 * time.Second)
+		gc.Stdout = os.Stdout
+		gc.Stderr = os.Stderr
+		if err := gc.Start(); err == nil && gc.Process != nil {
+			if pidFile := os.Getenv("AGENTFIXTURE_GC_PID_FILE"); pidFile != "" {
+				_ = os.WriteFile(pidFile, []byte(strconv.Itoa(gc.Process.Pid)), 0600)
+			}
+		}
+		time.Sleep(15 * time.Second)
 		os.Exit(0)
 	}
 
@@ -214,6 +219,16 @@ func TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pidFile := filepath.Join(t.TempDir(), "gc.pid")
+	defer func() {
+		if raw, rErr := os.ReadFile(pidFile); rErr == nil {
+			if pid, pErr := strconv.Atoi(strings.TrimSpace(string(raw))); pErr == nil && pid > 0 {
+				if proc, fErr := os.FindProcess(pid); fErr == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+	}()
 
 	start := time.Now()
 	report, err := Run(RunOptions{
@@ -221,8 +236,9 @@ func TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang(t *testing.T) {
 		Command:  []string{exe, "-test.run=^TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang$"},
 		Env: map[string]string{
 			"AGENTFIXTURE_RUNNER_HANG_ROLE": "child",
+			"AGENTFIXTURE_GC_PID_FILE":      pidFile,
 		},
-		Timeout: 200 * time.Millisecond,
+		Timeout: 500 * time.Millisecond,
 	})
 	elapsed := time.Since(start)
 	if err != nil {
@@ -231,8 +247,8 @@ func TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang(t *testing.T) {
 	if report.CommandExitCode != 124 || report.Passed {
 		t.Fatalf("expected timeout exit code 124 and Passed=false, got code=%d passed=%v", report.CommandExitCode, report.Passed)
 	}
-	// WaitDelay is 3s + 200ms timeout -> must return well before the 12s grandchild sleep!
+	// WaitDelay is 3s + 200ms timeout -> must return ~3.2s, well before the 15s grandchild sleep!
 	if elapsed > 8*time.Second {
-		t.Fatalf("expected cmd.WaitDelay to prevent 12s grandchild pipe hang, but Run took %v", elapsed)
+		t.Fatalf("expected cmd.WaitDelay to prevent 15s grandchild pipe hang, but Run took %v", elapsed)
 	}
 }
