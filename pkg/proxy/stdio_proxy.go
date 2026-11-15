@@ -109,22 +109,81 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 		}
 
 		rawBytes := []byte(trimmed)
-		var rawObj map[string]json.RawMessage
-		if json.Unmarshal(rawBytes, &rawObj) == nil {
-			if rpcReq, decErr := decodeJSONRPCRequest(rawBytes); decErr == nil && rpcReq.Method != "" {
-				_, hasID := rawObj["id"]
-				// JSON-RPC 2.0 & MCP spec: Notifications omit "id" (or pass null id on notification methods) and MUST NOT receive a response.
-				if !hasID || rpcReq.ID == nil {
+
+		// 1. JSON-RPC 2.0 Batch array (`[...]`)
+		if rawBytes[0] == '[' {
+			var batchElems []json.RawMessage
+			if json.Unmarshal(rawBytes, &batchElems) == nil {
+				if len(batchElems) == 0 {
+					inv := newInvalidRequestResponse(nil, "Invalid Request: empty batch")
+					b, mErr := json.Marshal(inv)
+					if mErr != nil {
+						return mErr
+					}
+					if wErr := writeStdioFrame(out, b, framing); wErr != nil {
+						return wErr
+					}
 					continue
 				}
-				if err := sr.handleJSONRPC(rpcReq, out, framing); err != nil {
-					return err
+
+				responses := make([]JSONRPCResponse, 0, len(batchElems))
+				for _, elem := range batchElems {
+					elemTrimmed := bytes.TrimSpace(elem)
+					if len(elemTrimmed) == 0 || elemTrimmed[0] != '{' {
+						responses = append(responses, newInvalidRequestResponse(nil, "Invalid Request: batch item must be an object"))
+						continue
+					}
+					var elemObj map[string]json.RawMessage
+					if json.Unmarshal(elemTrimmed, &elemObj) != nil {
+						responses = append(responses, newInvalidRequestResponse(nil, "Invalid Request: malformed batch item"))
+						continue
+					}
+					resp, shouldReply := sr.processJSONRPCObject(elemTrimmed, elemObj)
+					if shouldReply {
+						responses = append(responses, resp)
+					}
+				}
+
+				// Per JSON-RPC 2.0 Section 6: if the batch contains only Notifications, nothing is returned.
+				if len(responses) > 0 {
+					b, mErr := json.Marshal(responses)
+					if mErr != nil {
+						return mErr
+					}
+					if wErr := writeStdioFrame(out, b, framing); wErr != nil {
+						return wErr
+					}
 				}
 				continue
 			}
 		}
 
-		// Fallback: raw line or non-JSON-RPC tool invocation
+		// 2. Single JSON-RPC 2.0 object (`{...}`)
+		if rawBytes[0] == '{' {
+			var rawObj map[string]json.RawMessage
+			if json.Unmarshal(rawBytes, &rawObj) == nil {
+				_, hasJSONRPC := rawObj["jsonrpc"]
+				_, hasMethod := rawObj["method"]
+				if hasJSONRPC || hasMethod {
+					rpcReq, decErr := decodeJSONRPCRequest(rawBytes)
+					if hasJSONRPC || (decErr == nil && rpcReq.Method != "") {
+						resp, shouldReply := sr.processJSONRPCObject(rawBytes, rawObj)
+						if shouldReply {
+							b, mErr := json.Marshal(resp)
+							if mErr != nil {
+								return mErr
+							}
+							if wErr := writeStdioFrame(out, b, framing); wErr != nil {
+								return wErr
+							}
+						}
+						continue
+					}
+				}
+			}
+		}
+
+		// 3. Fallback: raw line or non-JSON-RPC tool invocation
 		req := &cassette.Request{
 			RawBody: trimmed,
 		}
@@ -156,11 +215,65 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 	}
 }
 
-func (sr *StdioReplayer) handleJSONRPC(rpcReq JSONRPCRequest, out io.Writer, framing stdioFraming) error {
+func newInvalidRequestResponse(id interface{}, msg string) JSONRPCResponse {
+	return JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: map[string]interface{}{
+			"code":    -32600,
+			"message": msg,
+		},
+	}
+}
+
+func isValidNonNullRPCID(idRaw json.RawMessage, decodedID interface{}) bool {
+	trimmed := bytes.TrimSpace(idRaw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || decodedID == nil {
+		return false
+	}
+	switch decodedID.(type) {
+	case string, json.Number, float64, int, int64:
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeReplyID(decodedID interface{}) interface{} {
+	switch decodedID.(type) {
+	case string, json.Number, float64, int, int64:
+		return decodedID
+	default:
+		return nil
+	}
+}
+
+func (sr *StdioReplayer) processJSONRPCObject(rawBytes []byte, rawObj map[string]json.RawMessage) (JSONRPCResponse, bool) {
+	rpcReq, decErr := decodeJSONRPCRequest(rawBytes)
+	idRaw, hasID := rawObj["id"]
+
+	if decErr != nil || rpcReq.Method == "" {
+		return newInvalidRequestResponse(sanitizeReplyID(rpcReq.ID), "Invalid Request"), true
+	}
+
+	// JSON-RPC 2.0 Notification: omitted "id" member MUST NOT receive a response.
+	if !hasID {
+		return JSONRPCResponse{}, false
+	}
+
+	// Explicit "id": null or non-scalar "id" in a request -> return JSON-RPC 2.0 -32600 Invalid Request with "id": null.
+	if !isValidNonNullRPCID(idRaw, rpcReq.ID) {
+		return newInvalidRequestResponse(nil, "Invalid Request: request id must be a non-null string or number"), true
+	}
+
+	return sr.evaluateJSONRPC(rpcReq), true
+}
+
+func (sr *StdioReplayer) evaluateJSONRPC(rpcReq JSONRPCRequest) JSONRPCResponse {
 	var toolName string
 	var toolArgs map[string]interface{}
 
-	if strings.Contains(rpcReq.Method, "tool") && len(rpcReq.Params) > 0 {
+	if rpcReq.Method == "tools/call" && len(rpcReq.Params) > 0 {
 		if parsed, err := matcher.DecodeJSONUseNumber(rpcReq.Params); err == nil {
 			if pMap, ok := parsed.(map[string]interface{}); ok {
 				if n, ok := pMap["name"].(string); ok {
@@ -220,6 +333,8 @@ func (sr *StdioReplayer) handleJSONRPC(rpcReq JSONRPCRequest, out io.Writer, fra
 			}
 		} else if inter.Response.Body != nil {
 			resp.Result = inter.Response.Body
+		} else if inter.Response.RawBody != "" && json.Valid([]byte(inter.Response.RawBody)) {
+			resp.Result = json.RawMessage(inter.Response.RawBody)
 		} else {
 			resp.Result = inter.Response.RawBody
 		}
@@ -236,11 +351,7 @@ func (sr *StdioReplayer) handleJSONRPC(rpcReq JSONRPCRequest, out io.Writer, fra
 		}
 	}
 
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	return writeStdioFrame(out, b, framing)
+	return resp
 }
 
 func (sr *StdioReplayer) synthesizeProtocolResponse(method string) (interface{}, bool) {
@@ -326,8 +437,10 @@ func (sr *StdioReplayer) findMatch(candidate *cassette.Request) *cassette.Intera
 
 	if bestInter != nil {
 		sr.matchedIDs[bestInter.ID] = true
+		cloned := bestInter.Clone()
+		return &cloned
 	}
-	return bestInter
+	return nil
 }
 
 // StdioRecorder taps bidirectional JSON-RPC / MCP stdio traffic between a host client and a child MCP server process.
@@ -370,6 +483,7 @@ func (r *StdioRecorder) RecordCommand(ctx context.Context, cmdArgs []string, env
 		return nil, fmt.Errorf("mcp command cannot be empty")
 	}
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	cmd.WaitDelay = 3 * time.Second
 	if len(env) > 0 {
 		cmd.Env = env
 	}
@@ -430,6 +544,41 @@ func (r *StdioRecorder) RecordStreams(clientIn io.Reader, serverIn io.WriteClose
 	return r.GetCassette(), nil
 }
 
+func (r *StdioRecorder) registerPendingRequestObject(raw []byte) {
+	var rawObj map[string]json.RawMessage
+	if json.Unmarshal(raw, &rawObj) != nil {
+		return
+	}
+	rpcReq, decErr := decodeJSONRPCRequest(raw)
+	if decErr != nil || rpcReq.Method == "" {
+		return
+	}
+	idRaw, hasID := rawObj["id"]
+	if !hasID || !isValidNonNullRPCID(idRaw, rpcReq.ID) {
+		return
+	}
+
+	var toolName string
+	var toolArgs map[string]interface{}
+	if rpcReq.Method == "tools/call" && len(rpcReq.Params) > 0 {
+		if parsed, pErr := matcher.DecodeJSONUseNumber(rpcReq.Params); pErr == nil {
+			if pMap, ok := parsed.(map[string]interface{}); ok {
+				toolName, _ = pMap["name"].(string)
+				toolArgs, _ = pMap["arguments"].(map[string]interface{})
+			}
+		}
+	}
+	key := rpcIDKey(rpcReq.ID)
+	r.mu.Lock()
+	r.pending[key] = pendingRPC{
+		req:      rpcReq,
+		toolName: toolName,
+		toolArgs: toolArgs,
+		sentAt:   time.Now(),
+	}
+	r.mu.Unlock()
+}
+
 func (r *StdioRecorder) pumpRequests(src io.Reader, dst io.Writer) error {
 	br := bufio.NewReaderSize(src, 64*1024)
 	for {
@@ -439,29 +588,17 @@ func (r *StdioRecorder) pumpRequests(src io.Reader, dst io.Writer) error {
 		}
 		trimmed := bytes.TrimSpace(payload)
 		if len(trimmed) > 0 {
-			var rawObj map[string]json.RawMessage
-			if json.Unmarshal(trimmed, &rawObj) == nil {
-				if rpcReq, decErr := decodeJSONRPCRequest(trimmed); decErr == nil && rpcReq.Method != "" {
-					if _, hasID := rawObj["id"]; hasID && rpcReq.ID != nil {
-						var toolName string
-						var toolArgs map[string]interface{}
-						if strings.Contains(rpcReq.Method, "tool") && len(rpcReq.Params) > 0 {
-							if parsed, pErr := matcher.DecodeJSONUseNumber(rpcReq.Params); pErr == nil {
-								if pMap, ok := parsed.(map[string]interface{}); ok {
-									toolName, _ = pMap["name"].(string)
-									toolArgs, _ = pMap["arguments"].(map[string]interface{})
-								}
-							}
+			switch trimmed[0] {
+			case '{':
+				r.registerPendingRequestObject(trimmed)
+			case '[':
+				var batch []json.RawMessage
+				if json.Unmarshal(trimmed, &batch) == nil {
+					for _, elem := range batch {
+						elemTrimmed := bytes.TrimSpace(elem)
+						if len(elemTrimmed) > 0 && elemTrimmed[0] == '{' {
+							r.registerPendingRequestObject(elemTrimmed)
 						}
-						key := rpcIDKey(rpcReq.ID)
-						r.mu.Lock()
-						r.pending[key] = pendingRPC{
-							req:      rpcReq,
-							toolName: toolName,
-							toolArgs: toolArgs,
-							sentAt:   time.Now(),
-						}
-						r.mu.Unlock()
 					}
 				}
 			}
@@ -469,6 +606,24 @@ func (r *StdioRecorder) pumpRequests(src io.Reader, dst io.Writer) error {
 		if err := writeStdioFrame(dst, payload, framing); err != nil {
 			return err
 		}
+	}
+}
+
+func (r *StdioRecorder) processIncomingResponseObject(raw []byte) {
+	rpcResp, decErr := decodeJSONRPCResponse(raw)
+	if decErr != nil || rpcResp.ID == nil {
+		return
+	}
+	key := rpcIDKey(rpcResp.ID)
+	r.mu.Lock()
+	pend, ok := r.pending[key]
+	if ok {
+		delete(r.pending, key)
+	}
+	r.mu.Unlock()
+
+	if ok {
+		r.recordPairedInteraction(pend, rpcResp)
 	}
 }
 
@@ -481,17 +636,18 @@ func (r *StdioRecorder) pumpResponses(src io.Reader, dst io.Writer) error {
 		}
 		trimmed := bytes.TrimSpace(payload)
 		if len(trimmed) > 0 {
-			if rpcResp, decErr := decodeJSONRPCResponse(trimmed); decErr == nil && rpcResp.ID != nil {
-				key := rpcIDKey(rpcResp.ID)
-				r.mu.Lock()
-				pend, ok := r.pending[key]
-				if ok {
-					delete(r.pending, key)
-				}
-				r.mu.Unlock()
-
-				if ok {
-					r.recordPairedInteraction(pend, rpcResp)
+			switch trimmed[0] {
+			case '{':
+				r.processIncomingResponseObject(trimmed)
+			case '[':
+				var batch []json.RawMessage
+				if json.Unmarshal(trimmed, &batch) == nil {
+					for _, elem := range batch {
+						elemTrimmed := bytes.TrimSpace(elem)
+						if len(elemTrimmed) > 0 && elemTrimmed[0] == '{' {
+							r.processIncomingResponseObject(elemTrimmed)
+						}
+					}
 				}
 			}
 		}
@@ -549,9 +705,9 @@ func (r *StdioRecorder) recordPairedInteraction(pend pendingRPC, rpcResp JSONRPC
 	}
 
 	r.mu.Lock()
-	seq := len(r.cas.Interactions) + 1
+	id, seq := nextInteractionID(r.cas.Interactions, "mcp_")
 	inter := cassette.Interaction{
-		ID:       fmt.Sprintf("mcp_%03d", seq),
+		ID:       id,
 		Sequence: seq,
 		Type:     interType,
 		Request:  req,
@@ -668,9 +824,29 @@ func rpcIDKey(id interface{}) string {
 	}
 }
 
+// isMIMEHeaderLine reports whether trimmed begins an HTTP/MIME-style stdio header block
+// (e.g. `Content-Length: 120`, `Content-Type: application/vscode-jsonrpc`, `X-Request-Id: abc`).
 func isMIMEHeaderLine(trimmed string) bool {
-	lower := strings.ToLower(trimmed)
-	return strings.HasPrefix(lower, "content-length:") || strings.HasPrefix(lower, "content-type:")
+	colon := strings.IndexByte(trimmed, ':')
+	if colon <= 0 {
+		return false
+	}
+	// Exclude URL schemes such as http:// or https://
+	if strings.HasPrefix(trimmed[colon:], "://") {
+		return false
+	}
+	name := trimmed[:colon]
+	first := name[0]
+	if !((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func readStdioFrame(br *bufio.Reader) ([]byte, stdioFraming, error) {

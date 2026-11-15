@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-and-release:
     name: Build & Publish Release
@@ -31,7 +34,7 @@ jobs:
       - name: Build Multi-Platform Binaries
         run: |
           mkdir -p dist
-          VERSION=${GITHUB_REF_NAME:-v1.2.1}
+          VERSION=${GITHUB_REF_NAME:-v1.2.2}
 
           # Windows amd64
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${VERSION}" -o dist/agentfixture.exe ./cmd/agentfixture

@@ -286,3 +286,94 @@ func TestImportTracePortSession_V12TagsDuplicateFrameIndexAndClockSkew(t *testin
 		t.Errorf("expected turn git_snapshot preserved, got %q", cas.Interactions[0].Metadata["git_snapshot"])
 	}
 }
+
+func TestImportTracePortSession_SliceTagsAndStandaloneOutputFrames(t *testing.T) {
+	// Actual `traceport record` sessions emit `tags` as a JSON string slice `["ci", "agent"]`
+	// and non-interactive CLI recordings emit standalone `output` / `error` frames with no preceding `input`.
+	sessionJSON := `{
+		"id": "tp_record_cli_01",
+		"command": "pytest -q --api-key=sk-ant-api03-1234567890abcdef1234567890",
+		"start_time": "2026-11-15T10:00:00Z",
+		"end_time": "2026-11-15T10:00:02Z",
+		"status": "completed",
+		"tags": ["ci", "agent", "env=staging", "api_key=raw-secret-in-tag"],
+		"frames": [
+			{
+				"index": 1,
+				"timestamp": "2026-11-15T10:00:00.050Z",
+				"type": "checkpoint",
+				"git_snapshot": "zstd:cli_snap_01"
+			},
+			{
+				"index": 2,
+				"timestamp": "2026-11-15T10:00:01.050Z",
+				"type": "output",
+				"content": "12 passed in 0.98s (key AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe)"
+			},
+			{
+				"index": 3,
+				"timestamp": "2026-11-15T10:00:01.550Z",
+				"type": "error",
+				"content": "warning: deprecated fixture"
+			}
+		]
+	}`
+
+	cas, err := ImportTracePortSession([]byte(sessionJSON))
+	if err != nil {
+		t.Fatalf("ImportTracePortSession with []string tags failed: %v", err)
+	}
+	if err := cas.Validate(); err != nil {
+		t.Fatalf("imported cassette failed Validate(): %v", err)
+	}
+	if cas.Metadata.Tags["ci"] != "true" || cas.Metadata.Tags["agent"] != "true" || cas.Metadata.Tags["env"] != "staging" {
+		t.Fatalf("expected []string tags converted into Metadata.Tags, got: %+v", cas.Metadata.Tags)
+	}
+	if cas.Metadata.Tags["tags"] != "ci,agent" {
+		t.Errorf("expected summary tags='ci,agent', got %q", cas.Metadata.Tags["tags"])
+	}
+	if cas.Metadata.Tags["api_key"] != "[REDACTED]" {
+		t.Errorf("expected sensitive key=value tag in []string to be redacted, got %q", cas.Metadata.Tags["api_key"])
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(cas); hasSec {
+		t.Fatalf("unredacted secret found in imported CLI session: %s", reason)
+	}
+
+	if len(cas.Interactions) != 2 {
+		t.Fatalf("expected 2 interactions (standalone output + standalone error), got %d", len(cas.Interactions))
+	}
+	outInter := cas.Interactions[0]
+	if outInter.ID != "tp_out_2" || outInter.Type != cassette.InteractionTypeStdio {
+		t.Errorf("unexpected standalone output interaction: %+v", outInter)
+	}
+	if !strings.Contains(outInter.Response.RawBody, "12 passed in 0.98s") || outInter.Response.StatusCode != 200 {
+		t.Errorf("unexpected standalone output response: %+v", outInter.Response)
+	}
+	if outInter.Response.LatencyMs != 1000 {
+		t.Errorf("expected computed latency 1000ms from checkpoint->output, got %d", outInter.Response.LatencyMs)
+	}
+
+	errInter := cas.Interactions[1]
+	if errInter.ID != "tp_err_3" || errInter.Response.StatusCode != 500 || errInter.Response.Error != "warning: deprecated fixture" {
+		t.Errorf("unexpected standalone error interaction: %+v", errInter)
+	}
+
+	// Verify split .meta.json (with []string tags) + .frames.jsonl (standalone output) also round-trips cleanly
+	tmpDir := t.TempDir()
+	metaFile := filepath.Join(tmpDir, "tp_split_arr.meta.json")
+	framesFile := filepath.Join(tmpDir, "tp_split_arr.frames.jsonl")
+	outYAML := filepath.Join(tmpDir, "out.yaml")
+	if err := os.WriteFile(metaFile, []byte(`{"id":"tp_split_arr","command":"echo hi","start_time":"2026-11-15T11:00:00Z","status":"completed","tags":["ci","smoke"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(framesFile, []byte(`{"index":1,"timestamp":"2026-11-15T11:00:01Z","type":"output","content":"hi"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	splitCas, err := ImportTracePortFile(metaFile, outYAML)
+	if err != nil {
+		t.Fatalf("ImportTracePortFile with []string tags in .meta.json failed: %v", err)
+	}
+	if len(splitCas.Interactions) != 1 || splitCas.Metadata.Tags["ci"] != "true" || splitCas.Metadata.Tags["smoke"] != "true" {
+		t.Fatalf("unexpected split import result: tags=%+v interactions=%+v", splitCas.Metadata.Tags, splitCas.Interactions)
+	}
+}

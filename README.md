@@ -111,9 +111,13 @@ Download pre-compiled binaries for Linux (`amd64`/`arm64`), macOS (`amd64`/`arm6
 curl -fsSL https://github.com/aloneangel45/AgentFixture/releases/latest/download/agentfixture-linux-amd64.tar.gz | tar -xz
 sudo mv agentfixture /usr/local/bin/
 
-# Windows (PowerShell)
-Invoke-WebRequest -Uri https://github.com/aloneangel45/AgentFixture/releases/latest/download/agentfixture-windows-amd64.zip -OutFile agentfixture.zip
-Expand-Archive agentfixture.zip -DestinationPath C:\Windows\System32
+# Windows (PowerShell - verified one-line installer recommended, or pure .NET ZipFile extraction)
+irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
+# Or extract manually without module autoloading:
+# [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# (New-Object System.Net.WebClient).DownloadFile('https://github.com/aloneangel45/AgentFixture/releases/latest/download/agentfixture-windows-amd64.zip', 'agentfixture.zip')
+# [void][System.Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
+# [System.IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path 'agentfixture.zip').Path, "$env:LOCALAPPDATA\Programs\AgentFixture\bin")
 ```
 
 ### Go Install
@@ -277,7 +281,7 @@ version: "agentfixture/v1"
 metadata:
   cassette_id: "cas_anthropic_sse_01"
   recorded_at: "2026-11-10T16:40:00Z"
-  generator: "AgentFixture v1.2.1"
+  generator: "AgentFixture v1.2.2"
   model: "claude-sonnet-4-20250514"
   metrics:
     total_interactions: 1

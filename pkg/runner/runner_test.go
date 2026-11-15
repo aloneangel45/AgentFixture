@@ -3,6 +3,8 @@ package runner
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -186,5 +188,51 @@ func TestTestReport_FormatSummary_RegressionDetected(t *testing.T) {
 	}
 	if !strings.Contains(summary, "0.88") {
 		t.Errorf("expected drift details listed, got: %s", summary)
+	}
+}
+
+func TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang(t *testing.T) {
+	if os.Getenv("AGENTFIXTURE_RUNNER_HANG_ROLE") == "grandchild" {
+		time.Sleep(12 * time.Second)
+		os.Exit(0)
+	}
+	if os.Getenv("AGENTFIXTURE_RUNNER_HANG_ROLE") == "child" {
+		exe, err := os.Executable()
+		if err == nil {
+			gc := exec.Command(exe, "-test.run=^TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang$")
+			gc.Env = append(os.Environ(), "AGENTFIXTURE_RUNNER_HANG_ROLE=grandchild")
+			// Inherit stdout & stderr pipes so grandchild keeps them open after child is killed!
+			gc.Stdout = os.Stdout
+			gc.Stderr = os.Stderr
+			_ = gc.Start()
+		}
+		time.Sleep(12 * time.Second)
+		os.Exit(0)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	report, err := Run(RunOptions{
+		Cassette: cassette.NewCassette("cas_timeout_waitdelay"),
+		Command:  []string{exe, "-test.run=^TestRunner_TimeoutWithGrandchildHoldingPipesDoesNotHang$"},
+		Env: map[string]string{
+			"AGENTFIXTURE_RUNNER_HANG_ROLE": "child",
+		},
+		Timeout: 200 * time.Millisecond,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected error from timed-out Run: %v", err)
+	}
+	if report.CommandExitCode != 124 || report.Passed {
+		t.Fatalf("expected timeout exit code 124 and Passed=false, got code=%d passed=%v", report.CommandExitCode, report.Passed)
+	}
+	// WaitDelay is 3s + 200ms timeout -> must return well before the 12s grandchild sleep!
+	if elapsed > 8*time.Second {
+		t.Fatalf("expected cmd.WaitDelay to prevent 12s grandchild pipe hang, but Run took %v", elapsed)
 	}
 }

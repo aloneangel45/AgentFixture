@@ -24,13 +24,13 @@ import (
 )
 
 func TestCLI_VersionFormattingNoDoubleV(t *testing.T) {
-	if got := formatVersionString("v1.2.1"); !strings.Contains(got, "AgentFixture v1.2.1") || strings.Contains(got, "vv1.2.1") {
-		t.Fatalf("unexpected version formatting for v1.2.1: %q", got)
+	if got := formatVersionString("v1.2.2"); !strings.Contains(got, "AgentFixture v1.2.2") || strings.Contains(got, "vv1.2.2") {
+		t.Fatalf("unexpected version formatting for v1.2.2: %q", got)
 	}
-	if got := formatVersionString("1.2.1"); !strings.Contains(got, "AgentFixture v1.2.1") {
-		t.Fatalf("unexpected version formatting for 1.2.1: %q", got)
+	if got := formatVersionString("1.2.2"); !strings.Contains(got, "AgentFixture v1.2.2") {
+		t.Fatalf("unexpected version formatting for 1.2.2: %q", got)
 	}
-	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.2.1") {
+	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.2.2") {
 		t.Fatalf("unexpected empty fallback version formatting: %q", got)
 	}
 }
@@ -548,10 +548,68 @@ func TestCLI_ReplayWithJUnitXML(t *testing.T) {
 	}
 }
 
+func sanitizeWindowsPS51Env(base []string, overrides ...string) []string {
+	sysRoot := os.Getenv("SystemRoot")
+	if sysRoot == "" {
+		sysRoot = `C:\Windows`
+	}
+	ps5Modules := filepath.Join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "Modules")
+
+	filtered := make([]string, 0, len(base)+len(overrides)+1)
+	for _, kv := range base {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			filtered = append(filtered, kv)
+			continue
+		}
+		key := kv[:eq]
+		val := kv[eq+1:]
+		if strings.EqualFold(key, "PSModulePath") {
+			parts := strings.Split(val, string(os.PathListSeparator))
+			clean := []string{ps5Modules}
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p == "" || strings.Contains(strings.ToLower(p), `powershell\7`) || strings.Contains(strings.ToLower(p), `powershell/7`) {
+					continue
+				}
+				if !strings.EqualFold(strings.TrimRight(p, `\/`), strings.TrimRight(ps5Modules, `\/`)) {
+					clean = append(clean, p)
+				}
+			}
+			filtered = append(filtered, "PSModulePath="+strings.Join(clean, string(os.PathListSeparator)))
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+
+	// Apply overrides (case-insensitively replacing matching keys)
+	for _, ov := range overrides {
+		eq := strings.IndexByte(ov, '=')
+		if eq <= 0 {
+			continue
+		}
+		ovKey := ov[:eq]
+		replaced := false
+		for i, existing := range filtered {
+			eEq := strings.IndexByte(existing, '=')
+			if eEq > 0 && strings.EqualFold(existing[:eEq], ovKey) {
+				filtered[i] = ov
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			filtered = append(filtered, ov)
+		}
+	}
+	return filtered
+}
+
 func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	shPath := filepath.Join(repoRoot, "install.sh")
 	ps1Path := filepath.Join(repoRoot, "install.ps1")
+	readmePath := filepath.Join(repoRoot, "README.md")
 
 	shBytes, err := os.ReadFile(shPath)
 	if err != nil {
@@ -575,10 +633,37 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 		t.Fatalf("missing install.ps1: %v", err)
 	}
 	ps1Text := string(ps1Bytes)
-	for _, needle := range []string{"aloneangel45/AgentFixture", "checksums.txt", "agentfixture-windows-", "Cryptography.SHA256", "SHA256"} {
+	for _, needle := range []string{
+		"aloneangel45/AgentFixture",
+		"checksums.txt",
+		"agentfixture-windows-",
+		"Cryptography.SHA256",
+		"SHA256",
+		"Install-AgentFixture",
+		"System.IO.Compression.FileSystem",
+		"ReadOnly",
+		"Tls12",
+	} {
 		if !strings.Contains(ps1Text, needle) {
 			t.Errorf("install.ps1 missing expected reference %q", needle)
 		}
+	}
+	for _, line := range strings.Split(ps1Text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "exit ") || trimmed == "exit" {
+			t.Errorf("install.ps1 must not use script-scope exit (kills caller shell under irm | iex): %q", trimmed)
+		}
+	}
+
+	readmeBytes, err := os.ReadFile(readmePath)
+	if err != nil {
+		t.Fatalf("missing README.md: %v", err)
+	}
+	if strings.Contains(string(readmeBytes), "Expand-Archive") {
+		t.Errorf("README.md should not recommend Expand-Archive due to cross-edition PSModulePath issues")
 	}
 
 	if runtime.GOOS != "windows" {
@@ -593,7 +678,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	// Build a tiny real zip containing a compiled Windows helper binary that prints version
 	tmpDir := t.TempDir()
 	binSrc := filepath.Join(tmpDir, "stub.go")
-	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.2.1 (installer-test)\") }\n"), 0644); err != nil {
+	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.2.2 (installer-test)\") }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	builtExe := filepath.Join(tmpDir, "agentfixture.exe")
@@ -646,10 +731,10 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	}))
 	defer releaseSrv.Close()
 
-	// 1. Valid SHA-256 checksum -> installs cleanly
+	// 1. Valid SHA-256 checksum with sanitized PSModulePath -> installs cleanly
 	installDirOK := filepath.Join(tmpDir, "installed_ok")
 	cmdOK := exec.Command(pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1Path)
-	cmdOK.Env = append(os.Environ(),
+	cmdOK.Env = sanitizeWindowsPS51Env(os.Environ(),
 		"AGENTFIXTURE_BASE_URL="+releaseSrv.URL,
 		"AGENTFIXTURE_INSTALL_DIR="+installDirOK,
 		"AGENTFIXTURE_NO_PATH_UPDATE=1",
@@ -658,18 +743,40 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install.ps1 failed on valid SHA-256 archive: %v\nOutput:\n%s", err, string(outOK))
 	}
-	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.2.1") {
+	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.2.2") {
 		t.Errorf("unexpected install.ps1 output:\n%s", string(outOK))
 	}
-	if _, statErr := os.Stat(filepath.Join(installDirOK, "agentfixture.exe")); statErr != nil {
+	destExeOK := filepath.Join(installDirOK, "agentfixture.exe")
+	if _, statErr := os.Stat(destExeOK); statErr != nil {
 		t.Fatalf("expected agentfixture.exe installed in %s: %v", installDirOK, statErr)
 	}
 
-	// 2. Tampered SHA-256 checksum -> MUST abort with non-zero exit code and NOT install binary!
+	// 2. Empty PSModulePath + ReadOnly target .exe + `iex` caller-shell survival check!
+	if err := os.Chmod(destExeOK, 0444); err != nil {
+		t.Fatalf("failed marking existing exe ReadOnly: %v", err)
+	}
+	iexCmd := fmt.Sprintf("$script = [System.IO.File]::ReadAllText('%s'); Invoke-Expression $script; [Console]::WriteLine('CALLER_SHELL_ALIVE')",
+		strings.ReplaceAll(ps1Path, "'", "''"))
+	cmdEmptyMod := exec.Command(pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", iexCmd)
+	cmdEmptyMod.Env = sanitizeWindowsPS51Env(os.Environ(),
+		"PSModulePath=",
+		"AGENTFIXTURE_BASE_URL="+releaseSrv.URL,
+		"AGENTFIXTURE_INSTALL_DIR="+installDirOK,
+		"AGENTFIXTURE_NO_PATH_UPDATE=1",
+	)
+	outEmptyMod, errEmptyMod := cmdEmptyMod.CombinedOutput()
+	if errEmptyMod != nil {
+		t.Fatalf("install.ps1 failed with empty PSModulePath / ReadOnly target / iex: %v\nOutput:\n%s", errEmptyMod, string(outEmptyMod))
+	}
+	if !strings.Contains(string(outEmptyMod), "CALLER_SHELL_ALIVE") {
+		t.Fatalf("expected caller PowerShell session to remain alive after Invoke-Expression, got:\n%s", string(outEmptyMod))
+	}
+
+	// 3. Tampered SHA-256 checksum -> MUST abort with non-zero exit code and NOT install binary!
 	tamperChecksums = true
 	installDirBad := filepath.Join(tmpDir, "installed_tampered")
 	cmdBad := exec.Command(pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1Path)
-	cmdBad.Env = append(os.Environ(),
+	cmdBad.Env = sanitizeWindowsPS51Env(os.Environ(),
 		"AGENTFIXTURE_BASE_URL="+releaseSrv.URL,
 		"AGENTFIXTURE_INSTALL_DIR="+installDirBad,
 		"AGENTFIXTURE_NO_PATH_UPDATE=1",

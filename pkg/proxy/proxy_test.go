@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +12,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
@@ -447,5 +451,263 @@ func TestStdioProxy_MIMEHeaderOrder64BitIDMCPIsErrorAndTruncatedEOF(t *testing.T
 	errTrunc := replayer.ProcessStream(strings.NewReader(truncated), &truncOut)
 	if !errors.Is(errTrunc, io.ErrUnexpectedEOF) {
 		t.Fatalf("expected io.ErrUnexpectedEOF on truncated Content-Length frame, got: %v", errTrunc)
+	}
+}
+
+func TestStdioProxy_NullIDBatchRawJSONCustomMIMEDeclassificationAndConcurrency(t *testing.T) {
+	// 1. Record a batch of [tools/list (with params!), tools/call] starting with X-Request-Id header
+	existingCas := cassette.NewCassette("mcp_v122")
+	// Seed with mcp_004 to verify collision-free nextInteractionID -> mcp_005, mcp_006!
+	existingCas.Interactions = append(existingCas.Interactions, cassette.Interaction{
+		ID:       "mcp_004",
+		Sequence: 4,
+		Type:     cassette.InteractionTypeStdio,
+		Request:  cassette.Request{Method: "ping"},
+		Response: cassette.Response{Body: map[string]interface{}{}},
+	})
+
+	rec := NewStdioRecorder(existingCas)
+	serverInR, serverInW := io.Pipe()
+	serverOutR, serverOutW := io.Pipe()
+
+	batchReq := `[{"jsonrpc":"2.0","id":10,"method":"tools/list","params":{"name":"should_not_become_tool_name"}},{"jsonrpc":"2.0","method":"notifications/progress","params":{"step":1}},{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo_tool","arguments":{"msg":"hi"}}}]`
+	framedBatchReq := fmt.Sprintf("X-Request-Id: trace-abc-99\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s", len(batchReq), batchReq)
+
+	batchResp := `[{"jsonrpc":"2.0","id":10,"result":{"tools":[{"name":"echo_tool"}]}},{"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"echo: hi"}]}}]`
+	framedBatchResp := fmt.Sprintf("X-Trace-Id: srv-1\r\nContent-Length: %d\r\n\r\n%s", len(batchResp), batchResp)
+
+	go func() {
+		defer serverOutW.Close()
+		buf := make([]byte, len(framedBatchReq))
+		_, _ = io.ReadFull(serverInR, buf)
+		_, _ = io.WriteString(serverOutW, framedBatchResp)
+	}()
+
+	var liveClientOut bytes.Buffer
+	recCas, err := rec.RecordStreams(strings.NewReader(framedBatchReq), serverInW, serverOutR, &liveClientOut)
+	if err != nil {
+		t.Fatalf("RecordStreams batch with X-Request-Id MIME header failed: %v", err)
+	}
+	if err := recCas.Validate(); err != nil {
+		t.Fatalf("expected collision-free IDs passing Validate(), got: %v", err)
+	}
+	if len(recCas.Interactions) != 3 {
+		t.Fatalf("expected 3 total interactions (1 seeded + 2 recorded from batch), got %d", len(recCas.Interactions))
+	}
+	if recCas.Interactions[1].ID != "mcp_005" || recCas.Interactions[2].ID != "mcp_006" {
+		t.Fatalf("expected collision-free IDs mcp_005 & mcp_006 after mcp_004, got %s & %s",
+			recCas.Interactions[1].ID, recCas.Interactions[2].ID)
+	}
+	// Verify tools/list was NOT misclassified as InteractionTypeTool!
+	if recCas.Interactions[1].Type != cassette.InteractionTypeStdio || recCas.Interactions[1].Request.ToolName != "" {
+		t.Fatalf("tools/list must be InteractionTypeStdio with empty ToolName, got type=%s toolName=%q",
+			recCas.Interactions[1].Type, recCas.Interactions[1].Request.ToolName)
+	}
+	if recCas.Interactions[2].Type != cassette.InteractionTypeTool || recCas.Interactions[2].Request.ToolName != "echo_tool" {
+		t.Fatalf("tools/call must be InteractionTypeTool with ToolName='echo_tool', got %+v", recCas.Interactions[2])
+	}
+
+	// Add an interaction with Body == nil && valid JSON RawBody to verify zero double-encoding!
+	rawJSONReq := cassette.Request{
+		Method:  "resources/list",
+		RawBody: `{}`,
+	}
+	rawJSONReq.Matcher.StrictHash = matcher.ComputeRequestHash(&rawJSONReq)
+	recCas.Interactions = append(recCas.Interactions, cassette.Interaction{
+		ID:       "mcp_007",
+		Sequence: 7,
+		Type:     cassette.InteractionTypeStdio,
+		Request:  rawJSONReq,
+		Response: cassette.Response{
+			RawBody: `{"resources":[{"uri":"file:///README.md","count":2}]}`,
+		},
+	})
+
+	replayer := NewStdioReplayer(recCas, matcher.NewStrictMatcher())
+
+	// 2a. Omitted "id" (notification) -> zero bytes written; Explicit "id": null -> -32600 error with "id": null!
+	notifAndNullInput := strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`,
+		`[]`,
+		`[{"jsonrpc":"2.0","method":"notifications/only"}]`,
+		`{"jsonrpc":"2.0","id":99,"method":"resources/list","params":{}}`,
+	}, "\n") + "\n"
+
+	var outBuf bytes.Buffer
+	if err := replayer.ProcessStream(strings.NewReader(notifAndNullInput), &outBuf); err != nil {
+		t.Fatalf("ProcessStream failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(outBuf.String()), "\n")
+	// Expect exactly 3 lines: (1) explicit id:null -32600, (2) empty [] -32600, (3) id:99 resources/list structured JSON!
+	// Both notifications (single and notification-only batch) MUST emit zero lines!
+	if len(lines) != 3 {
+		t.Fatalf("expected exactly 3 response lines (notifications silent), got %d:\n%s", len(lines), outBuf.String())
+	}
+
+	var nullIDResp map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[0]), &nullIDResp); err != nil {
+		t.Fatalf("invalid JSON on explicit null id response: %v (%s)", err, lines[0])
+	}
+	if _, hasIDKey := nullIDResp["id"]; !hasIDKey || nullIDResp["id"] != nil {
+		t.Errorf("expected explicit \"id\": null in -32600 response, got: %s", lines[0])
+	}
+	if errObj, _ := nullIDResp["error"].(map[string]interface{}); errObj == nil || errObj["code"] != float64(-32600) {
+		t.Errorf("expected error.code == -32600 on explicit null id request, got: %s", lines[0])
+	}
+
+	var emptyBatchResp map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[1]), &emptyBatchResp); err != nil {
+		t.Fatalf("invalid JSON on empty batch [] response: %v (%s)", err, lines[1])
+	}
+	if errObj, _ := emptyBatchResp["error"].(map[string]interface{}); errObj == nil || errObj["code"] != float64(-32600) {
+		t.Errorf("expected -32600 on empty batch [], got: %s", lines[1])
+	}
+
+	// Verify RawBody JSON was NOT double-encoded as a string literal!
+	var resListResp struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  struct {
+			Resources []struct {
+				URI   string `json:"uri"`
+				Count int    `json:"count"`
+			} `json:"resources"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(lines[2]), &resListResp); err != nil {
+		t.Fatalf("RawBody JSON was double-encoded or invalid instead of JSON object: %v\nLine: %s", err, lines[2])
+	}
+	if len(resListResp.Result.Resources) != 1 || resListResp.Result.Resources[0].URI != "file:///README.md" {
+		t.Errorf("unexpected decoded RawBody result: %+v", resListResp)
+	}
+
+	// 2b. Replay batch request framed with leading X-Request-Id header + concurrent goroutines
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var bOut bytes.Buffer
+			if pErr := replayer.ProcessStream(strings.NewReader(framedBatchReq), &bOut); pErr != nil {
+				t.Errorf("concurrent batch ProcessStream failed: %v", pErr)
+				return
+			}
+			s := bOut.String()
+			if !strings.HasPrefix(s, "Content-Length:") || !strings.Contains(s, `"echo: hi"`) {
+				t.Errorf("unexpected batch replay frame: %s", s)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHTTPProxy_AbortedSSEStreamNotRecordedAndCollisionFreeIDs(t *testing.T) {
+	mode := "abort_mid_stream"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch mode {
+		case "abort_mid_stream":
+			// Hijack TCP socket to send HTTP 200 chunked SSE header + partial frame, then close abruptly WITHOUT terminal 0-length chunk!
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("ResponseWriter does not support Hijacker")
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			part := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+			_, _ = fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(part), part)
+			_ = buf.Flush()
+			// Abruptly close socket without 0\r\n\r\n chunk terminator -> triggers io.ErrUnexpectedEOF!
+		case "slow_stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if fl, ok := w.(http.Flusher); ok {
+				_, _ = fmt.Fprint(w, "event: ping\ndata: {}\n\n")
+				fl.Flush()
+			}
+			<-r.Context().Done()
+		case "clean_json":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer upstream.Close()
+
+	// Seed cassette with int_005 (only 1 element, so naive len+1=2 would collide if int_002 existed or produce out-of-order ID!)
+	seeded := cassette.NewCassette("cas_sse_abort_and_ids")
+	seeded.Interactions = []cassette.Interaction{
+		{
+			ID:       "int_002",
+			Sequence: 2,
+			Type:     cassette.InteractionTypeHTTP,
+			Request:  cassette.Request{Method: "GET", Endpoint: "/seed"},
+			Response: cassette.Response{StatusCode: 200, RawBody: "seed"},
+		},
+	}
+
+	srv, err := NewServer(Config{
+		Mode:        ModeRecord,
+		UpstreamURL: upstream.URL,
+		Cassette:    seeded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.httpServer.ReadHeaderTimeout != 15*time.Second {
+		t.Errorf("expected ReadHeaderTimeout=15s, got %v", srv.httpServer.ReadHeaderTimeout)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	// 1. Upstream drops TCP mid-SSE stream (chunked framing truncated -> ErrUnexpectedEOF): MUST NOT be recorded!
+	if resp, reqErr := http.Get(srv.URL() + "/v1/messages"); reqErr == nil {
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	if got := len(srv.GetCassette().Interactions); got != 1 {
+		t.Fatalf("expected truncated upstream SSE stream NOT to be recorded (interactions=%d, want 1)", got)
+	}
+
+	// 2. Client cancels context mid-SSE stream: MUST NOT be recorded!
+	mode = "slow_stream"
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	reqSlow, _ := http.NewRequestWithContext(ctx, "POST", srv.URL()+"/v1/messages", strings.NewReader(`{"stream":true}`))
+	if resp, reqErr := http.DefaultClient.Do(reqSlow); reqErr == nil {
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	cancel()
+	if got := len(srv.GetCassette().Interactions); got != 1 {
+		t.Fatalf("expected client-cancelled SSE stream NOT to be recorded (interactions=%d, want 1)", got)
+	}
+
+	// 3. Clean HTTP request appends collision-free int_003 (NOT duplicate int_002!)
+	mode = "clean_json"
+	respOK, err := http.Get(srv.URL() + "/v1/ok")
+	if err != nil {
+		t.Fatalf("clean request failed: %v", err)
+	}
+	_, _ = io.ReadAll(respOK.Body)
+	_ = respOK.Body.Close()
+
+	finalCas := srv.GetCassette()
+	if err := finalCas.Validate(); err != nil {
+		t.Fatalf("expected collision-free cassette to pass Validate(), got: %v", err)
+	}
+	if len(finalCas.Interactions) != 2 || finalCas.Interactions[1].ID != "int_003" || finalCas.Interactions[1].Sequence != 3 {
+		t.Fatalf("expected second interaction to have ID='int_003' Sequence=3, got %+v", finalCas.Interactions[1])
+	}
+
+	// 4. Verify readBoundedBody rejects payloads exceeding limit
+	_, bErr := readBoundedBody(strings.NewReader("0123456789"), 5)
+	if !errors.Is(bErr, errBodyTooLarge) {
+		t.Errorf("expected errBodyTooLarge from readBoundedBody, got %v", bErr)
 	}
 }

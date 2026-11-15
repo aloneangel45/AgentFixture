@@ -25,7 +25,7 @@ import (
 )
 
 // Version is injected at build time via -ldflags="-X main.Version=...".
-var Version = "1.2.1"
+var Version = "1.2.2"
 
 const (
 	ProgramName = "AgentFixture"
@@ -77,7 +77,7 @@ func main() {
 func formatVersionString(ver string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(ver), "v")
 	if clean == "" {
-		clean = "1.2.1"
+		clean = "1.2.2"
 	}
 	return fmt.Sprintf("%s v%s (%s)", ProgramName, clean, Banner)
 }

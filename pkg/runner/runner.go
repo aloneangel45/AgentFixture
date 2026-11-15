@@ -191,6 +191,7 @@ func Run(opts RunOptions) (*TestReport, error) {
 
 	startTime := time.Now()
 	cmd := exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Env = envVars
 
 	var outputBuf bytes.Buffer

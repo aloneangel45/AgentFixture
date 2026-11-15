@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -34,4 +40,4 @@ jobs:
         run: go test -bench=Benchmark -benchmem -benchtime=100ms -run=NONE ./pkg/cassette ./pkg/matcher
 
       - name: Compile CLI Binary
-        run: go build -v -ldflags="-s -w -X main.Version=v1.2.1" ./cmd/agentfixture
+        run: go build -v -ldflags="-s -w -X main.Version=v1.2.2" ./cmd/agentfixture

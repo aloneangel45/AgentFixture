@@ -5,11 +5,13 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,11 @@ import (
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 )
+
+// MaxHTTPBodyBytes caps non-SSE HTTP request and response bodies at 64 MiB.
+const MaxHTTPBodyBytes int64 = 64 << 20
+
+var errBodyTooLarge = errors.New("http body exceeds 64 MiB limit")
 
 // Mode determines proxy runtime behavior.
 type Mode string
@@ -116,7 +123,10 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Register handler directly (bypassing ServeMux path redirects so HTTP CONNECT and proxy URIs work cleanly).
 	s.inFlightCond = sync.NewCond(&s.inFlightMu)
-	s.httpServer = &http.Server{Handler: http.HandlerFunc(s.handleHTTP)}
+	s.httpServer = &http.Server{
+		Handler:           http.HandlerFunc(s.handleHTTP),
+		ReadHeaderTimeout: 15 * time.Second,
+	}
 
 	return s, nil
 }
@@ -231,6 +241,50 @@ func (s *Server) UnmatchedRequests() []cassette.Request {
 	return copied
 }
 
+func readBoundedBody(r io.Reader, maxBytes int64) ([]byte, error) {
+	lr := io.LimitReader(r, maxBytes+1)
+	b, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, errBodyTooLarge
+	}
+	return b, nil
+}
+
+// nextInteractionID scans existing interactions to allocate a collision-free ID and monotonic sequence number.
+func nextInteractionID(interactions []cassette.Interaction, prefix string) (string, int) {
+	if prefix == "" {
+		prefix = "int_"
+	}
+	seen := make(map[string]bool, len(interactions))
+	maxSeq := len(interactions)
+
+	for _, inter := range interactions {
+		seen[inter.ID] = true
+		if inter.Sequence > maxSeq {
+			maxSeq = inter.Sequence
+		}
+		for _, p := range []string{prefix, "int_", "mcp_"} {
+			if strings.HasPrefix(inter.ID, p) {
+				if n, err := strconv.Atoi(inter.ID[len(p):]); err == nil && n > maxSeq {
+					maxSeq = n
+				}
+			}
+		}
+	}
+
+	seq := maxSeq + 1
+	for {
+		candidate := fmt.Sprintf("%s%03d", prefix, seq)
+		if !seen[candidate] {
+			return candidate, seq
+		}
+		seq++
+	}
+}
+
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	s.inFlightMu.Lock()
 	s.inFlight++
@@ -255,12 +309,16 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readBoundedBody(r.Body, MaxHTTPBodyBytes)
+	_ = r.Body.Close()
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "Request body exceeds maximum 64 MiB limit", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
-	_ = r.Body.Close()
 
 	headers := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
@@ -525,6 +583,9 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 
 		flusher, _ := w.(http.Flusher)
 		events, streamErr := cassette.RecordSSEStream(bodyReader, func(ev cassette.SSEEvent) error {
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				return ctxErr
+			}
 			encoded := cassette.EncodeSSEEvent(ev)
 			if _, wErr := w.Write(encoded); wErr != nil {
 				return wErr
@@ -534,6 +595,10 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 			}
 			return nil
 		})
+		if (streamErr != nil && streamErr != io.EOF) || r.Context().Err() != nil {
+			// Do not record truncated or aborted mid-flight SSE streams into the cassette.
+			return
+		}
 		duration := time.Since(start).Milliseconds()
 
 		summary := cassette.ReconstructStreamSummary(events)
@@ -549,9 +614,6 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		}
 		if summary.MessageID != "" {
 			meta["message_id"] = summary.MessageID
-		}
-		if streamErr != nil && streamErr != io.EOF {
-			meta["stream_error"] = cassette.RedactString(streamErr.Error())
 		}
 
 		storedReq := candidate.Clone()
@@ -584,8 +646,8 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		cassette.RedactInteraction(&inter)
 
 		s.mu.Lock()
-		seq := len(s.cassette.Interactions) + 1
-		inter.ID = fmt.Sprintf("int_%03d", seq)
+		id, seq := nextInteractionID(s.cassette.Interactions, "int_")
+		inter.ID = id
 		inter.Sequence = seq
 		if s.cassette.Metadata.Model == "" && resolvedModel != "" {
 			s.cassette.Metadata.Model = resolvedModel
@@ -595,10 +657,12 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		return
 	}
 
-	respBody, err := io.ReadAll(bodyReader)
+	respBody, err := readBoundedBody(bodyReader, MaxHTTPBodyBytes)
 	duration := time.Since(start).Milliseconds()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to read upstream response body: %v", err), http.StatusBadGateway)
+	if err != nil || r.Context().Err() != nil {
+		if r.Context().Err() == nil {
+			http.Error(w, fmt.Sprintf("Failed to read upstream response body: %v", err), http.StatusBadGateway)
+		}
 		return
 	}
 
@@ -643,8 +707,8 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 	cassette.RedactInteraction(&inter)
 
 	s.mu.Lock()
-	seq := len(s.cassette.Interactions) + 1
-	inter.ID = fmt.Sprintf("int_%03d", seq)
+	id, seq := nextInteractionID(s.cassette.Interactions, "int_")
+	inter.ID = id
 	inter.Sequence = seq
 	if s.cassette.Metadata.Model == "" && detectedModel != "" {
 		s.cassette.Metadata.Model = detectedModel
@@ -715,7 +779,7 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request, bodyB
 		}
 		return
 	}
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, MaxHTTPBodyBytes))
 }
 
 func joinUpstreamURL(upstream *url.URL, reqURL *url.URL) string {
