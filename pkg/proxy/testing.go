@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"testing"
@@ -116,7 +117,7 @@ func NewTestServer(tb testing.TB, cassettePath string, opts ...TestOption) *Test
 	} else if cfg.recordMode == RecordModeNewEpisodes {
 		cas, err = cassette.Load(cassettePath)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				cas = cassette.NewCassette(tb.Name())
 				cas.Metadata.Source = "agentfixture_go_sdk"
 			} else {

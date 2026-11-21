@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -364,5 +368,225 @@ func TestHTTPProxy_HybridRecordModeNewEpisodes(t *testing.T) {
 		if resp.StatusCode != 200 {
 			t.Fatalf("expected 200 offline for %s, got %d", prompt, resp.StatusCode)
 		}
+	}
+}
+
+func TestHTTPProxy_ChaosDropSSE_NonHijackableAndClientCancel(t *testing.T) {
+	events, err := cassette.DecodeSSE(strings.NewReader(
+		"event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range events {
+		events[i].DeltaMs = 50
+	}
+
+	cas := cassette.NewCassette("cas_sse_non_hijack")
+	req := cassette.Request{
+		Method:   "POST",
+		Endpoint: "/v1/messages",
+		RawBody:  `{"stream":true}`,
+	}
+	req.Matcher.StrictHash = matcher.ComputeRequestHash(&req)
+	cas.Interactions = append(cas.Interactions, cassette.Interaction{
+		ID:       "int_sse_1",
+		Sequence: 1,
+		Type:     cassette.InteractionTypeSSE,
+		Request:  req,
+		Response: cassette.Response{
+			StatusCode: 200,
+			Headers:    map[string]string{"Content-Type": "text/event-stream"},
+			SSEEvents:  events,
+		},
+	})
+
+	// 1. Non-hijackable ResponseRecorder fallback emits deterministic stream_interrupted SSE error frame.
+	inj1, err := chaos.NewInjector(chaos.Config{DropSSEAfter: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv1, err := NewServer(Config{
+		Mode:     ModeReplay,
+		Cassette: cas,
+		Chaos:    inj1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"stream":true}`))
+	srv1.httpServer.Handler.ServeHTTP(rec, httpReq)
+
+	if rec.Header().Get("X-AgentFixture-Chaos") != "drop_sse" {
+		t.Fatalf("expected X-AgentFixture-Chaos=drop_sse header, got %q", rec.Header().Get("X-AgentFixture-Chaos"))
+	}
+	decoded, decErr := cassette.DecodeSSE(bytes.NewReader(rec.Body.Bytes()))
+	if decErr != nil {
+		t.Fatalf("failed to decode fallback SSE events: %v", decErr)
+	}
+	if len(decoded) != 3 || decoded[2].Event != cassette.SSEEventError || !strings.Contains(decoded[2].Data, "stream_interrupted") {
+		t.Fatalf("expected 2 events + stream_interrupted error frame on non-hijackable writer, got %+v", decoded)
+	}
+	if srv1.ChaosStats().SSEDropsInjected != 1 {
+		t.Fatalf("expected SSEDropsInjected=1, got %+v", srv1.ChaosStats())
+	}
+
+	// 2. Client context canceled before dropSSEAfter completes -> must NOT falsely record SSE drop.
+	inj2, err := chaos.NewInjector(chaos.Config{DropSSEAfter: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2, err := NewServer(Config{
+		Mode:      ModeReplay,
+		Cassette:  cas,
+		Chaos:     inj2,
+		SSETiming: cassette.SSETimingConfig{Mode: cassette.SSETimingExact, MaxChunkDelay: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec2 := httptest.NewRecorder()
+	httpReq2 := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"stream":true}`)).WithContext(ctx)
+	srv2.httpServer.Handler.ServeHTTP(rec2, httpReq2)
+
+	if srv2.ChaosStats().SSEDropsInjected != 0 {
+		t.Fatalf("expected SSEDropsInjected=0 when client canceled before drop point, got %+v", srv2.ChaosStats())
+	}
+}
+
+func TestHTTPProxy_NewEpisodes_SecretRedactionConcurrencyAndUpstreamValidation(t *testing.T) {
+	// Malformed scheme-less upstream URL must be rejected cleanly.
+	if _, err := NewServer(Config{
+		Mode:        ModeReplay,
+		RecordMode:  RecordModeNewEpisodes,
+		UpstreamURL: "api.anthropic.com",
+	}); err == nil {
+		t.Fatalf("expected error for scheme-less UpstreamURL")
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Set-Cookie", "session=super-secret-cookie-value")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"reply":"ok","leaked":"sk-proj-1234567890abcdef1234567890","api_key":"inline-secret"}`))
+	}))
+	defer upstream.Close()
+
+	srv, err := NewServer(Config{
+		Mode:        ModeReplay,
+		RecordMode:  RecordModeNewEpisodes,
+		UpstreamURL: upstream.URL,
+		Cassette:    cassette.NewCassette("cas_parallel_new_ep"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	client := &http.Client{Timeout: 5 * time.Second}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := `{"prompt":"parallel_ep_` + string(rune('A'+idx)) + `","api_key":"client-inline-secret"}`
+			req, _ := http.NewRequest("POST", srv.URL()+"/v1/messages?key=AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer sk-ant-api03-1234567890abcdef1234567890")
+			resp, rErr := client.Do(req)
+			if rErr != nil {
+				t.Errorf("worker %d request failed: %v", idx, rErr)
+				return
+			}
+			_, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("worker %d status=%d, want 200", idx, resp.StatusCode)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	cas := srv.GetCassette()
+	if len(cas.Interactions) != workers {
+		t.Fatalf("expected %d recorded interactions, got %d", workers, len(cas.Interactions))
+	}
+	if err := cas.Validate(); err != nil {
+		t.Fatalf("recorded parallel cassette failed Validate(): %v", err)
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(cas); hasSec {
+		t.Fatalf("SECURITY FAILURE: unredacted secret found in new_episodes cassette BEFORE save: %s", reason)
+	}
+
+	outPath := filepath.Join(t.TempDir(), "hybrid_redacted.yaml")
+	if err := cassette.Save(outPath, cas); err != nil {
+		t.Fatalf("atomic cassette.Save failed: %v", err)
+	}
+	reloaded, err := cassette.Load(outPath)
+	if err != nil {
+		t.Fatalf("reloading saved cassette failed: %v", err)
+	}
+	if hasSec, reason := cassette.CheckForUnredactedSecrets(reloaded); hasSec {
+		t.Fatalf("SECURITY FAILURE: unredacted secret persisted to disk: %s", reason)
+	}
+}
+
+func TestTestServer_NewEpisodes_CreatesNonExistentCassette(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	casPath := filepath.Join(t.TempDir(), "brand_new_hybrid.yaml")
+	ts := NewTestServer(t, casPath, WithTestHybridRecordMode(RecordModeNewEpisodes, upstream.URL))
+
+	resp, err := ts.HTTPClient().Post(ts.URL()+"/v1/messages", "application/json", strings.NewReader(`{"prompt":"first"}`))
+	if err != nil {
+		t.Fatalf("request through NewTestServer failed: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if ts.Server().NewEpisodesCount() != 1 {
+		t.Fatalf("expected 1 new episode, got %d", ts.Server().NewEpisodesCount())
+	}
+}
+
+func TestStdioReplayer_ProcessStreamContextCancelDuringChaosLatency(t *testing.T) {
+	cas := cassette.NewCassette("cas_mcp_cancel")
+	inj, err := chaos.NewInjector(chaos.Config{LatencyMs: 10000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayer := NewStdioReplayer(cas, matcher.NewStrictMatcher())
+	replayer.SetChaos(inj)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	var out bytes.Buffer
+	err = replayer.ProcessStreamContext(ctx, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`+"\n"), &out)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ProcessStreamContext hung despite context cancel: elapsed=%v", elapsed)
 	}
 }

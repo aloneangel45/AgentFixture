@@ -111,8 +111,20 @@ func (sr *StdioReplayer) MatchedIDs() map[string]bool {
 
 // ProcessStream reads NDJSON or Content-Length framed messages up to 16MB and writes cassette responses.
 func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
+	return sr.ProcessStreamContext(context.Background(), in, out)
+}
+
+// ProcessStreamContext reads NDJSON or Content-Length framed messages up to 16MB and writes cassette responses,
+// honoring ctx cancellation during chaos latency delays and between frames.
+func (sr *StdioReplayer) ProcessStreamContext(ctx context.Context, in io.Reader, out io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	br := bufio.NewReaderSize(in, 64*1024)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		payload, framing, err := readStdioFrame(br)
 		if err != nil {
 			if err == io.EOF {
@@ -145,6 +157,9 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 
 				responses := make([]JSONRPCResponse, 0, len(batchElems))
 				for _, elem := range batchElems {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
 					elemTrimmed := bytes.TrimSpace(elem)
 					if len(elemTrimmed) == 0 || elemTrimmed[0] != '{' {
 						responses = append(responses, newInvalidRequestResponse(nil, "Invalid Request: batch item must be an object"))
@@ -155,7 +170,10 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 						responses = append(responses, newInvalidRequestResponse(nil, "Invalid Request: malformed batch item"))
 						continue
 					}
-					resp, shouldReply := sr.processJSONRPCObject(elemTrimmed, elemObj)
+					resp, shouldReply, pErr := sr.processJSONRPCObject(ctx, elemTrimmed, elemObj)
+					if pErr != nil {
+						return pErr
+					}
 					if shouldReply {
 						responses = append(responses, resp)
 					}
@@ -184,7 +202,10 @@ func (sr *StdioReplayer) ProcessStream(in io.Reader, out io.Writer) error {
 				if hasJSONRPC || hasMethod {
 					rpcReq, decErr := decodeJSONRPCRequest(rawBytes)
 					if hasJSONRPC || (decErr == nil && rpcReq.Method != "") {
-						resp, shouldReply := sr.processJSONRPCObject(rawBytes, rawObj)
+						resp, shouldReply, pErr := sr.processJSONRPCObject(ctx, rawBytes, rawObj)
+						if pErr != nil {
+							return pErr
+						}
 						if shouldReply {
 							b, mErr := json.Marshal(resp)
 							if mErr != nil {
@@ -265,42 +286,48 @@ func sanitizeReplyID(decodedID interface{}) interface{} {
 	}
 }
 
-func (sr *StdioReplayer) processJSONRPCObject(rawBytes []byte, rawObj map[string]json.RawMessage) (JSONRPCResponse, bool) {
+func (sr *StdioReplayer) processJSONRPCObject(ctx context.Context, rawBytes []byte, rawObj map[string]json.RawMessage) (JSONRPCResponse, bool, error) {
 	rpcReq, decErr := decodeJSONRPCRequest(rawBytes)
 	idRaw, hasID := rawObj["id"]
 
 	if decErr != nil || rpcReq.Method == "" {
-		return newInvalidRequestResponse(sanitizeReplyID(rpcReq.ID), "Invalid Request"), true
+		return newInvalidRequestResponse(sanitizeReplyID(rpcReq.ID), "Invalid Request"), true, nil
 	}
 
 	// JSON-RPC 2.0 Notification: omitted "id" member MUST NOT receive a response.
 	if !hasID {
-		return JSONRPCResponse{}, false
+		return JSONRPCResponse{}, false, nil
 	}
 
 	// Explicit "id": null or non-scalar "id" in a request -> return JSON-RPC 2.0 -32600 Invalid Request with "id": null.
 	if !isValidNonNullRPCID(idRaw, rpcReq.ID) {
-		return newInvalidRequestResponse(nil, "Invalid Request: request id must be a non-null string or number"), true
+		return newInvalidRequestResponse(nil, "Invalid Request: request id must be a non-null string or number"), true, nil
 	}
 
-	return sr.evaluateJSONRPC(rpcReq), true
+	resp, err := sr.evaluateJSONRPC(ctx, rpcReq)
+	if err != nil {
+		return JSONRPCResponse{}, false, err
+	}
+	return resp, true, nil
 }
 
-func (sr *StdioReplayer) evaluateJSONRPC(rpcReq JSONRPCRequest) JSONRPCResponse {
+func (sr *StdioReplayer) evaluateJSONRPC(ctx context.Context, rpcReq JSONRPCRequest) (JSONRPCResponse, error) {
 	sr.mu.Lock()
 	inj := sr.chaos
 	sr.mu.Unlock()
 	if inj != nil && inj.Enabled() {
 		dec := inj.Evaluate()
 		if dec.Latency > 0 {
-			time.Sleep(dec.Latency)
+			if err := chaos.SleepContext(ctx, dec.Latency); err != nil {
+				return JSONRPCResponse{}, err
+			}
 		}
 		if dec.Fault != chaos.FaultNone {
 			return JSONRPCResponse{
 				JSONRPC: "2.0",
 				ID:      rpcReq.ID,
 				Error:   chaos.JSONRPCFaultError(dec.Fault),
-			}
+			}, nil
 		}
 	}
 
@@ -385,7 +412,7 @@ func (sr *StdioReplayer) evaluateJSONRPC(rpcReq JSONRPCRequest) JSONRPCResponse 
 		}
 	}
 
-	return resp
+	return resp, nil
 }
 
 func (sr *StdioReplayer) synthesizeProtocolResponse(method string) (interface{}, bool) {

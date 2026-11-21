@@ -6,11 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// MaxLatencyMs caps per-request chaos latency and jitter so LatencyJitterMs+1
+// and (LatencyMs+LatencyJitterMs)*time.Millisecond can never overflow int64.
+const MaxLatencyMs int64 = math.MaxInt64 / int64(time.Millisecond) / 2
 
 // FaultKind identifies the category of fault selected by an Injector.
 type FaultKind string
@@ -58,10 +63,16 @@ func (c Config) Validate() error {
 	if c.LatencyMs < 0 {
 		return fmt.Errorf("chaos latency-ms must be >= 0 (got %d)", c.LatencyMs)
 	}
+	if c.LatencyMs > MaxLatencyMs {
+		return fmt.Errorf("chaos latency-ms exceeds maximum %d (got %d)", MaxLatencyMs, c.LatencyMs)
+	}
 	if c.LatencyJitterMs < 0 {
 		return fmt.Errorf("chaos jitter-ms must be >= 0 (got %d)", c.LatencyJitterMs)
 	}
-	if c.ErrorRate < 0 || c.ErrorRate > 1 {
+	if c.LatencyJitterMs > MaxLatencyMs {
+		return fmt.Errorf("chaos jitter-ms exceeds maximum %d (got %d)", MaxLatencyMs, c.LatencyJitterMs)
+	}
+	if math.IsNaN(c.ErrorRate) || math.IsInf(c.ErrorRate, 0) || c.ErrorRate < 0 || c.ErrorRate > 1 {
 		return fmt.Errorf("chaos error-rate must be between 0.0 and 1.0 (got %v)", c.ErrorRate)
 	}
 	return nil

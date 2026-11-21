@@ -135,10 +135,13 @@ func NewServer(cfg Config) (*Server, error) {
 
 	var upstreamParsed *url.URL
 	var err error
-	if cfg.UpstreamURL != "" {
-		upstreamParsed, err = url.Parse(cfg.UpstreamURL)
+	if strings.TrimSpace(cfg.UpstreamURL) != "" {
+		upstreamParsed, err = url.Parse(strings.TrimSpace(cfg.UpstreamURL))
 		if err != nil {
 			return nil, fmt.Errorf("invalid upstream URL %s: %w", cfg.UpstreamURL, err)
+		}
+		if (upstreamParsed.Scheme != "http" && upstreamParsed.Scheme != "https") || upstreamParsed.Host == "" {
+			return nil, fmt.Errorf("invalid upstream URL %q: must include http:// or https:// scheme and host", cfg.UpstreamURL)
 		}
 	}
 
@@ -603,10 +606,16 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate 
 		if dropSSEAfter > 0 && len(events) >= dropSSEAfter {
 			w.Header().Set("X-AgentFixture-Chaos", "drop_sse")
 			w.WriteHeader(status)
-			_ = cassette.ReplaySSEStream(r.Context(), w, flusher, events[:dropSSEAfter], s.cfg.SSETiming)
+			if streamErr := cassette.ReplaySSEStream(r.Context(), w, flusher, events[:dropSSEAfter], s.cfg.SSETiming); streamErr != nil || r.Context().Err() != nil {
+				// Client disconnected or context canceled before chaos drop point.
+				return
+			}
 			s.cfg.Chaos.RecordSSEDrop()
 			if hj, ok := w.(http.Hijacker); ok {
-				if conn, _, hErr := hj.Hijack(); hErr == nil {
+				if conn, bufrw, hErr := hj.Hijack(); hErr == nil {
+					if bufrw != nil && bufrw.Writer != nil && bufrw.Writer.Buffered() > 0 {
+						_ = bufrw.Flush()
+					}
 					_ = conn.Close()
 					return
 				}

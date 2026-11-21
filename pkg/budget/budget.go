@@ -2,6 +2,7 @@ package budget
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,15 +23,15 @@ func (t Thresholds) HasAssertions() bool {
 	return t.MaxTokens > 0 || t.MaxCostUSD > 0 || t.MinCacheHitRate > 0
 }
 
-// Validate checks that threshold bounds are non-negative and cache hit rate is in [0.0, 1.0].
+// Validate checks that threshold bounds are non-negative, finite, and cache hit rate is in [0.0, 1.0].
 func (t Thresholds) Validate() error {
 	if t.MaxTokens < 0 {
 		return fmt.Errorf("max-tokens must be >= 0 (got %d)", t.MaxTokens)
 	}
-	if t.MaxCostUSD < 0 {
-		return fmt.Errorf("max-cost-usd must be >= 0 (got %.6f)", t.MaxCostUSD)
+	if math.IsNaN(t.MaxCostUSD) || math.IsInf(t.MaxCostUSD, 0) || t.MaxCostUSD < 0 {
+		return fmt.Errorf("max-cost-usd must be a finite number >= 0 (got %v)", t.MaxCostUSD)
 	}
-	if t.MinCacheHitRate < 0 || t.MinCacheHitRate > 1.0 {
+	if math.IsNaN(t.MinCacheHitRate) || math.IsInf(t.MinCacheHitRate, 0) || t.MinCacheHitRate < 0 || t.MinCacheHitRate > 1.0 {
 		return fmt.Errorf("min-cache-hit-rate must be between 0.0 and 1.0 (got %v)", t.MinCacheHitRate)
 	}
 	return nil
@@ -96,29 +97,34 @@ func EvaluateSubset(cas *cassette.Cassette, filterIDs map[string]bool, table *Pr
 		}
 
 		u := cassette.ExtractResponseUsage(&inter.Response)
-		rep.InputTokens += int64(u.InputTokens)
-		rep.OutputTokens += int64(u.OutputTokens)
-		rep.CacheCreationInputTokens += int64(u.CacheCreationInputTokens)
-		rep.CacheReadInputTokens += int64(u.CacheReadInputTokens)
+		inTok := maxInt64(0, int64(u.InputTokens))
+		outTok := maxInt64(0, int64(u.OutputTokens))
+		cacheCreateTok := maxInt64(0, int64(u.CacheCreationInputTokens))
+		cacheReadTok := maxInt64(0, int64(u.CacheReadInputTokens))
+		totalTok := maxInt64(0, int64(u.TotalTokens))
 
-		hasGranular := u.InputTokens > 0 || u.OutputTokens > 0 ||
-			u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0
+		rep.InputTokens += inTok
+		rep.OutputTokens += outTok
+		rep.CacheCreationInputTokens += cacheCreateTok
+		rep.CacheReadInputTokens += cacheReadTok
+
+		hasGranular := inTok > 0 || outTok > 0 || cacheCreateTok > 0 || cacheReadTok > 0
 
 		pricing, _, _ := table.Lookup(model)
 		if hasGranular {
-			interTotal := int64(u.TotalTokens)
+			interTotal := totalTok
 			if interTotal == 0 {
-				interTotal = int64(u.InputTokens + u.OutputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens)
+				interTotal = inTok + outTok + cacheCreateTok + cacheReadTok
 			}
 			rep.TotalTokens += interTotal
-			rep.EstimatedCostUSD += (float64(u.InputTokens)*pricing.InputPerMillion +
-				float64(u.OutputTokens)*pricing.OutputPerMillion +
-				float64(u.CacheReadInputTokens)*pricing.CacheReadPerMillion +
-				float64(u.CacheCreationInputTokens)*pricing.CacheWritePerMillion) / 1_000_000.0
-		} else if u.TotalTokens > 0 {
-			rep.TotalTokens += int64(u.TotalTokens)
+			rep.EstimatedCostUSD += (float64(inTok)*pricing.InputPerMillion +
+				float64(outTok)*pricing.OutputPerMillion +
+				float64(cacheReadTok)*pricing.CacheReadPerMillion +
+				float64(cacheCreateTok)*pricing.CacheWritePerMillion) / 1_000_000.0
+		} else if totalTok > 0 {
+			rep.TotalTokens += totalTok
 			blended := (pricing.InputPerMillion + pricing.OutputPerMillion) / 2.0
-			rep.EstimatedCostUSD += (float64(u.TotalTokens) * blended) / 1_000_000.0
+			rep.EstimatedCostUSD += (float64(totalTok) * blended) / 1_000_000.0
 		}
 	}
 
@@ -192,14 +198,25 @@ func applyThresholds(rep *Report, t Thresholds) {
 		})
 	}
 	if t.MinCacheHitRate > 0 && rep.CacheHitRate < t.MinCacheHitRate {
+		msg := fmt.Sprintf("prompt cache hit rate %.1f%% below min-cache-hit-rate %.1f%%", rep.CacheHitRate*100, t.MinCacheHitRate*100)
+		if rep.InputTokens+rep.CacheReadInputTokens+rep.CacheCreationInputTokens == 0 {
+			msg += " (no prompt tokens recorded)"
+		}
 		rep.Violations = append(rep.Violations, Violation{
 			Metric:  "min_cache_hit_rate",
 			Actual:  rep.CacheHitRate,
 			Limit:   t.MinCacheHitRate,
-			Message: fmt.Sprintf("prompt cache hit rate %.1f%% below min-cache-hit-rate %.1f%%", rep.CacheHitRate*100, t.MinCacheHitRate*100),
+			Message: msg,
 		})
 	}
 	rep.Passed = len(rep.Violations) == 0
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // ViolationSummary joins all violation messages into a single human-readable error string.
@@ -271,7 +288,7 @@ func FormatSummaryMarkdown(title string, rows []SummaryRow, agg Report, overallP
 	if !overallPassed {
 		badge = "FAIL"
 	}
-	sb.WriteString(fmt.Sprintf("## AgentFixture %s — `%s`\n\n", title, badge))
+	sb.WriteString(fmt.Sprintf("## AgentFixture %s — `%s`\n\n", sanitizeMarkdownLine(title), badge))
 	sb.WriteString("| Case / Cassette | Status | Interactions | Tokens | Est. Cost (USD) | Cache Hit | Notes |\n")
 	sb.WriteString("|---|---|---:|---:|---:|---:|---|\n")
 	for _, r := range rows {
@@ -279,11 +296,10 @@ func FormatSummaryMarkdown(title string, rows []SummaryRow, agg Report, overallP
 		if !r.Passed {
 			st = "FAIL"
 		}
-		notes := strings.ReplaceAll(strings.TrimSpace(r.Details), "|", "\\|")
-		notes = strings.ReplaceAll(notes, "\n", " ")
-		name := strings.ReplaceAll(r.Name, "|", "\\|")
-		sb.WriteString(fmt.Sprintf("| `%s` | **%s** | %d | %d | $%.4f | %.1f%% | %s |\n",
-			name, st, r.Interactions, r.TotalTokens, r.CostUSD, r.CacheHitRate*100, notes))
+		notes := escapeMarkdownCell(strings.TrimSpace(r.Details))
+		nameCell := formatMarkdownCodeCell(r.Name)
+		sb.WriteString(fmt.Sprintf("| %s | **%s** | %d | %d | $%.4f | %.1f%% | %s |\n",
+			nameCell, st, r.Interactions, r.TotalTokens, r.CostUSD, r.CacheHitRate*100, notes))
 	}
 	sb.WriteString(fmt.Sprintf("| **Total** | **%s** | **%d** | **%d** | **$%.4f** | **%.1f%%** | |\n",
 		badge, agg.InteractionCount, agg.TotalTokens, agg.EstimatedCostUSD, agg.CacheHitRate*100))
@@ -291,11 +307,47 @@ func FormatSummaryMarkdown(title string, rows []SummaryRow, agg Report, overallP
 	if len(agg.Violations) > 0 {
 		sb.WriteString("\n### Budget Violations\n")
 		for _, v := range agg.Violations {
-			sb.WriteString(fmt.Sprintf("- **%s**: %s\n", v.Metric, v.Message))
+			sb.WriteString(fmt.Sprintf("- **%s**: %s\n", sanitizeMarkdownLine(v.Metric), sanitizeMarkdownLine(v.Message)))
 		}
 	}
 	sb.WriteByte('\n')
 	return sb.String()
+}
+
+func sanitizeMarkdownLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
+}
+
+func escapeMarkdownCell(s string) string {
+	s = sanitizeMarkdownLine(s)
+	s = strings.ReplaceAll(s, "|", `\|`)
+	return s
+}
+
+// formatMarkdownCodeCell safely formats a string as a GFM inline code span inside a Markdown table cell,
+// escaping pipes and newlines and selecting a backtick fence longer than any backtick run in s.
+func formatMarkdownCodeCell(s string) string {
+	clean := escapeMarkdownCell(s)
+	maxRun := 0
+	curRun := 0
+	for i := 0; i < len(clean); i++ {
+		if clean[i] == '`' {
+			curRun++
+			if curRun > maxRun {
+				maxRun = curRun
+			}
+		} else {
+			curRun = 0
+		}
+	}
+	fence := strings.Repeat("`", maxRun+1)
+	if len(clean) > 0 && (clean[0] == '`' || clean[len(clean)-1] == '`' || (maxRun > 0 && (clean[0] == ' ' || clean[len(clean)-1] == ' '))) {
+		return fence + " " + clean + " " + fence
+	}
+	return fence + clean + fence
 }
 
 // AppendGitHubSummary appends markdown to path (creating parent directories if needed).
@@ -313,9 +365,12 @@ func AppendGitHubSummary(path string, markdown string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open GitHub summary file %q: %w", path, err)
 	}
-	defer f.Close()
-	if _, err := f.WriteString(markdown); err != nil {
+	if _, err := f.Write([]byte(markdown)); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("failed to write GitHub summary file %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close GitHub summary file %q: %w", path, err)
 	}
 	return nil
 }

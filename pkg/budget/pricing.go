@@ -5,6 +5,7 @@ package budget
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -125,6 +126,9 @@ func LoadPricingFile(path string) (*PricingTable, error) {
 	if err := json.Unmarshal(data, &rawMap); err != nil {
 		return nil, fmt.Errorf("failed to parse pricing file %q as JSON: %w", path, err)
 	}
+	if rawMap == nil {
+		return nil, fmt.Errorf("pricing file %q must contain a JSON object", path)
+	}
 
 	overrides := make(map[string]ModelPricing)
 	if modelsRaw, hasWrapped := rawMap["models"]; hasWrapped {
@@ -148,12 +152,21 @@ func LoadPricingFile(path string) (*PricingTable, error) {
 }
 
 func validatePricingRate(name string, rate ModelPricing) error {
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("pricing model name cannot be empty")
+	if normalizeModelName(name) == "" {
+		return fmt.Errorf("pricing model name %q cannot be empty", name)
 	}
-	if rate.InputPerMillion < 0 || rate.OutputPerMillion < 0 ||
-		rate.CacheReadPerMillion < 0 || rate.CacheWritePerMillion < 0 {
-		return fmt.Errorf("pricing rates for model %q must be >= 0", name)
+	for _, field := range []struct {
+		label string
+		val   float64
+	}{
+		{"input_per_million", rate.InputPerMillion},
+		{"output_per_million", rate.OutputPerMillion},
+		{"cache_read_per_million", rate.CacheReadPerMillion},
+		{"cache_write_per_million", rate.CacheWritePerMillion},
+	} {
+		if math.IsNaN(field.val) || math.IsInf(field.val, 0) || field.val < 0 {
+			return fmt.Errorf("pricing rate %s for model %q must be a finite number >= 0 (got %v)", field.label, name, field.val)
+		}
 	}
 	return nil
 }
@@ -213,8 +226,32 @@ func (t *PricingTable) Lookup(model string) (ModelPricing, string, bool) {
 
 func normalizeModelName(model string) string {
 	s := strings.ToLower(strings.TrimSpace(model))
-	for _, prefix := range []string{"models/", "anthropic/", "openai/", "google/", "publishers/google/models/"} {
-		s = strings.TrimPrefix(s, prefix)
+	// Handle full Vertex AI resource paths like projects/.../locations/.../publishers/google/models/<name>
+	if idx := strings.LastIndex(s, "/models/"); idx != -1 {
+		s = s[idx+len("/models/"):]
+	}
+	prefixes := []string{
+		"publishers/google/models/",
+		"publishers/anthropic/models/",
+		"models/",
+		"anthropic/",
+		"openai/",
+		"google/",
+		"vertex/",
+		"bedrock/",
+		"azure/",
+	}
+	for {
+		changed := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(s, prefix) {
+				s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
 	}
 	return strings.TrimSpace(s)
 }

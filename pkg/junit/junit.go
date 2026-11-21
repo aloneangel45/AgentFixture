@@ -268,6 +268,23 @@ func BuildReplaySuites(cas *cassette.Cassette, casPath string, rep *runner.TestR
 			suite.TestCases = append(suite.TestCases, tc)
 		}
 
+		if rep.BudgetViolation != "" {
+			msg := sanitizeXMLText(rep.BudgetViolation)
+			tc := TestCase{
+				Name:      "budget_gate",
+				ClassName: "agentfixture.replay." + sanitizeXMLText(casID),
+				File:      normPath,
+				Time:      "0.000000",
+				Failure: &Failure{
+					Message: msg,
+					Type:    "BudgetViolation",
+					Body:    sanitizeXMLText(fmt.Sprintf("Cassette: %s\nBudget Violation: %s", normPath, rep.BudgetViolation)),
+				},
+			}
+			suite.Failures++
+			suite.TestCases = append(suite.TestCases, tc)
+		}
+
 		if rep.CommandExitCode != 0 || len(suite.TestCases) == 0 || (!rep.Passed && suite.Failures == 0) {
 			tc := TestCase{
 				Name:      "command_execution",
@@ -400,14 +417,16 @@ func BuildSuiteSuites(suiteName string, cases []SuiteCaseInput, totalTokens int6
 			))
 		} else {
 			reason := "suite case failed"
+			bodyDetail := reason
 			if len(c.Failures) > 0 {
 				reason = strings.Join(c.Failures, "; ")
+				bodyDetail = strings.Join(c.Failures, "\n- ")
 			}
 			msg := sanitizeXMLText(reason)
 			tc.Failure = &Failure{
 				Message: msg,
 				Type:    "SuiteAssertionError",
-				Body:    sanitizeXMLText(fmt.Sprintf("Case: %s\nCassette: %s\nMode: %s\nFailures:\n- %s", c.Name, normPath, c.Mode, strings.Join(c.Failures, "\n- "))),
+				Body:    sanitizeXMLText(fmt.Sprintf("Case: %s\nCassette: %s\nMode: %s\nFailures:\n- %s", c.Name, normPath, c.Mode, bodyDetail)),
 			}
 			suite.Failures++
 		}

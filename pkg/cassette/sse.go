@@ -366,10 +366,13 @@ func computeChunkDelay(deltaMs int64, cfg SSETimingConfig) time.Duration {
 	case SSETimingInstant, "":
 		return 0
 	case SSETimingScaled:
-		if cfg.Scale <= 0 {
+		if math.IsNaN(cfg.Scale) || math.IsInf(cfg.Scale, 0) || cfg.Scale <= 0 {
 			return 0
 		}
 		d = time.Duration(float64(deltaMs) * cfg.Scale * float64(time.Millisecond))
+		if d < 0 {
+			d = 0
+		}
 	case SSETimingExact:
 		d = time.Duration(deltaMs) * time.Millisecond
 	default:

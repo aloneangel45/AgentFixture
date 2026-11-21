@@ -40,6 +40,7 @@ type TestReport struct {
 	CostSavedUSD      float64            `json:"cost_saved_usd"`
 	NewEpisodes       int                `json:"new_episodes,omitempty"`
 	ChaosStats        chaos.Stats        `json:"chaos_stats,omitempty"`
+	BudgetViolation   string             `json:"budget_violation,omitempty"`
 	Duration          time.Duration      `json:"duration"`
 	Passed            bool               `json:"passed"`
 }

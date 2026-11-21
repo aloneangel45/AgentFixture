@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +39,10 @@ type SuiteSpec struct {
 	Name     string       `json:"name,omitempty" yaml:"name,omitempty"`
 	Defaults CaseDefaults `json:"defaults,omitempty" yaml:"defaults,omitempty"`
 	Cases    []CaseSpec   `json:"cases" yaml:"cases"`
+
+	// baseDir holds the directory of the loaded suite manifest so suite-relative
+	// cassette and pricing paths resolve cleanly even if RunOptions.BaseDir is empty.
+	baseDir string
 }
 
 // CaseDefaults specifies shared default settings inherited by all cases in a suite.
@@ -135,6 +141,7 @@ func LoadSuiteFile(path string) (*SuiteSpec, error) {
 	if spec.Name == "" {
 		spec.Name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
+	spec.baseDir = filepath.Dir(path)
 	return &spec, nil
 }
 
@@ -145,6 +152,17 @@ func (s *SuiteSpec) Validate() error {
 	}
 	if len(s.Cases) == 0 {
 		return errors.New("suite must define at least one case")
+	}
+	if err := validateMatcherSpec(s.Defaults.Matcher, s.Defaults.Threshold); err != nil {
+		return fmt.Errorf("defaults: %w", err)
+	}
+	if _, err := cassette.ParseSSETimingMode(s.Defaults.Timing); err != nil {
+		return fmt.Errorf("defaults.timing: %w", err)
+	}
+	if strings.TrimSpace(s.Defaults.Timeout) != "" {
+		if err := validateTimeoutString(s.Defaults.Timeout); err != nil {
+			return fmt.Errorf("defaults.timeout: %w", err)
+		}
 	}
 	if err := s.Defaults.Budget.Validate(); err != nil {
 		return fmt.Errorf("defaults.budget: %w", err)
@@ -166,6 +184,17 @@ func (s *SuiteSpec) Validate() error {
 		if mode != "" && mode != "http" && mode != "mcp" && mode != "verify" {
 			return fmt.Errorf("case %q has unsupported mode %q (expected http, mcp, or verify)", name, c.Mode)
 		}
+		if err := validateMatcherSpec(c.Matcher, c.Threshold); err != nil {
+			return fmt.Errorf("case %q: %w", name, err)
+		}
+		if _, err := cassette.ParseSSETimingMode(c.Timing); err != nil {
+			return fmt.Errorf("case %q timing: %w", name, err)
+		}
+		if strings.TrimSpace(c.Timeout) != "" {
+			if err := validateTimeoutString(c.Timeout); err != nil {
+				return fmt.Errorf("case %q timeout: %w", name, err)
+			}
+		}
 		if err := c.Chaos.Validate(); err != nil {
 			return fmt.Errorf("case %q chaos: %w", name, err)
 		}
@@ -175,6 +204,28 @@ func (s *SuiteSpec) Validate() error {
 		if c.Assertions.MaxTurns < 0 {
 			return fmt.Errorf("case %q assertions.max_turns must be >= 0", name)
 		}
+	}
+	return nil
+}
+
+func validateMatcherSpec(matcherName string, threshold float64) error {
+	m := strings.ToLower(strings.TrimSpace(matcherName))
+	if m != "" && m != "strict" && m != "fuzzy" {
+		return fmt.Errorf("unsupported matcher %q (expected strict or fuzzy)", matcherName)
+	}
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 || threshold > 1.0 {
+		return fmt.Errorf("threshold must be between 0.0 and 1.0 (got %v)", threshold)
+	}
+	return nil
+}
+
+func validateTimeoutString(raw string) error {
+	dur, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid timeout %q: %w", raw, err)
+	}
+	if dur <= 0 {
+		return fmt.Errorf("timeout must be > 0 (got %q)", raw)
 	}
 	return nil
 }
@@ -259,18 +310,26 @@ func Run(spec *SuiteSpec, opts RunOptions) (*SuiteReport, error) {
 		return nil, err
 	}
 
+	if opts.Concurrency < 0 {
+		return nil, fmt.Errorf("concurrency must be >= 1 (got %d)", opts.Concurrency)
+	}
 	concurrency := opts.Concurrency
-	if concurrency <= 0 {
+	if concurrency == 0 {
 		concurrency = 4
 	}
 	if concurrency > len(spec.Cases) {
 		concurrency = len(spec.Cases)
 	}
 
+	baseDir := opts.BaseDir
+	if baseDir == "" {
+		baseDir = spec.baseDir
+	}
+
 	pricingTable := opts.PricingTable
 	if pricingTable == nil {
 		if strings.TrimSpace(spec.Defaults.PricingFile) != "" {
-			pPath := resolvePath(opts.BaseDir, spec.Defaults.PricingFile)
+			pPath := resolvePath(baseDir, spec.Defaults.PricingFile)
 			var err error
 			pricingTable, err = budget.LoadPricingFile(pPath)
 			if err != nil {
@@ -295,7 +354,7 @@ func Run(spec *SuiteSpec, opts RunOptions) (*SuiteReport, error) {
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				results[idx] = executeCase(spec.Cases[idx], spec.Defaults, opts.BaseDir, pricingTable, opts.DefaultBudget)
+				results[idx] = executeCase(spec.Cases[idx], spec.Defaults, baseDir, pricingTable, opts.DefaultBudget)
 			}
 		}()
 	}
@@ -489,7 +548,7 @@ func executeCase(c CaseSpec, defaults CaseDefaults, baseDir string, table *budge
 
 	// 4. Evaluate budget (merge defaults -> case -> CLI overrides if unset on case)
 	effBudget := mergeThresholds(defaults.Budget, c.Budget, cliBudget)
-	res.Budget = budget.Evaluate(cas, table, effBudget)
+	res.Budget = budget.EvaluateSubset(cas, matchedIDs, table, effBudget)
 	if !res.Budget.Passed {
 		for _, v := range res.Budget.Violations {
 			res.Failures = append(res.Failures, "budget: "+v.Message)
@@ -505,11 +564,19 @@ func executeCase(c CaseSpec, defaults CaseDefaults, baseDir string, table *budge
 	}
 
 	for _, reqTool := range c.Assertions.ExpectedTools {
+		reqTool = strings.TrimSpace(reqTool)
+		if reqTool == "" {
+			continue
+		}
 		if !toolSet[reqTool] {
 			res.Failures = append(res.Failures, fmt.Sprintf("assertion failed: expected tool %q was not invoked (observed: %v)", reqTool, observedTools))
 		}
 	}
 	for _, badTool := range c.Assertions.ForbiddenTools {
+		badTool = strings.TrimSpace(badTool)
+		if badTool == "" {
+			continue
+		}
 		if toolSet[badTool] {
 			res.Failures = append(res.Failures, fmt.Sprintf("assertion failed: forbidden tool %q was invoked", badTool))
 		}
@@ -528,25 +595,23 @@ func runMCPCaseCommand(cas *cassette.Cassette, m matcher.Matcher, chaosInj *chao
 	cmd := exec.CommandContext(ctx, c.Command, c.Args...)
 	cmd.WaitDelay = 3 * time.Second
 	if len(c.Env) > 0 {
-		env := append([]string(nil), os.Environ()...)
-		for k, v := range c.Env {
-			env = append(env, k+"="+v)
-		}
-		cmd.Env = env
+		cmd.Env = mergeProcessEnv(os.Environ(), c.Env, runtime.GOOS == "windows")
 	}
 
 	childStdin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1, nil, chaos.Stats{}, err
 	}
-	childStdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return 1, nil, chaos.Stats{}, err
-	}
+	// Route child stdout through an io.Pipe so Go's internal exec copy goroutine honors cmd.WaitDelay
+	// and never races with StdioReplayer reads when cmd.Wait() returns or times out.
+	stdoutR, stdoutW := io.Pipe()
+	cmd.Stdout = stdoutW
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Start(); err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return 1, nil, chaos.Stats{}, err
 	}
 
@@ -557,19 +622,18 @@ func runMCPCaseCommand(cas *cassette.Cassette, m matcher.Matcher, chaosInj *chao
 
 	replayDone := make(chan error, 1)
 	go func() {
-		rErr := replayer.ProcessStream(childStdout, childStdin)
-		_ = childStdin.Close()
-		replayDone <- rErr
+		defer func() {
+			_ = stdoutR.Close()
+			_ = childStdin.Close()
+		}()
+		replayDone <- replayer.ProcessStreamContext(ctx, stdoutR, childStdin)
 	}()
 
 	waitErr := cmd.Wait()
-	rErr := <-replayDone
-	if rErr != nil && !errors.Is(rErr, io.EOF) && !errors.Is(rErr, os.ErrClosed) {
-		// Pipe close errors after child exit are expected; ignore if process already finished.
-		if waitErr == nil && ctx.Err() == nil {
-			// Keep going if child exited cleanly.
-		}
-	}
+	// Close stdoutW and childStdin after cmd.Wait() so ProcessStreamContext receives clean EOF even if a grandchild held pipes.
+	_ = stdoutW.Close()
+	_ = childStdin.Close()
+	<-replayDone
 
 	exitCode := 0
 	if waitErr != nil {
@@ -584,6 +648,50 @@ func runMCPCaseCommand(cas *cassette.Cassette, m matcher.Matcher, chaosInj *chao
 	}
 
 	return exitCode, replayer.MatchedIDs(), replayer.ChaosStats(), nil
+}
+
+func mergeProcessEnv(base []string, overrides map[string]string, caseInsensitive bool) []string {
+	norm := func(k string) string {
+		if caseInsensitive {
+			return strings.ToUpper(k)
+		}
+		return k
+	}
+	type kvPair struct {
+		k, v string
+		raw  bool
+	}
+	idx := make(map[string]int, len(base)+len(overrides))
+	entries := make([]kvPair, 0, len(base)+len(overrides))
+	set := func(k, v string) {
+		nk := norm(k)
+		if pos, ok := idx[nk]; ok {
+			entries[pos] = kvPair{k: k, v: v}
+		} else {
+			idx[nk] = len(entries)
+			entries = append(entries, kvPair{k: k, v: v})
+		}
+	}
+	for _, item := range base {
+		eq := strings.IndexByte(item, '=')
+		if eq <= 0 {
+			entries = append(entries, kvPair{v: item, raw: true})
+			continue
+		}
+		set(item[:eq], item[eq+1:])
+	}
+	for k, v := range overrides {
+		set(k, v)
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.raw {
+			out = append(out, e.v)
+		} else {
+			out = append(out, e.k+"="+e.v)
+		}
+	}
+	return out
 }
 
 // ExtractObservedTools collects all unique tool/function names invoked across cassette interactions
@@ -607,6 +715,8 @@ func ExtractObservedTools(cas *cassette.Cassette, filterIDs map[string]bool) []s
 		}
 		if inter.Request.ToolName != "" {
 			addTool(inter.Request.ToolName)
+		} else if inter.Request.Method == "tools/call" {
+			extractMCPRequestToolName(&inter.Request, addTool)
 		}
 		if len(inter.Response.SSEEvents) > 0 {
 			sum := cassette.ReconstructStreamSummary(inter.Response.SSEEvents)
@@ -616,10 +726,19 @@ func ExtractObservedTools(cas *cassette.Cassette, filterIDs map[string]bool) []s
 		}
 		if inter.Response.Body != nil {
 			extractToolsFromJSONBody(inter.Response.Body, addTool)
-		} else if raw := strings.TrimSpace(inter.Response.RawBody); len(raw) > 0 && raw[0] == '{' {
-			var parsed interface{}
-			if json.Unmarshal([]byte(raw), &parsed) == nil {
-				extractToolsFromJSONBody(parsed, addTool)
+		} else if raw := strings.TrimSpace(inter.Response.RawBody); len(raw) > 0 {
+			if raw[0] == '{' {
+				var parsed interface{}
+				if json.Unmarshal([]byte(raw), &parsed) == nil {
+					extractToolsFromJSONBody(parsed, addTool)
+				}
+			} else if len(inter.Response.SSEEvents) == 0 && strings.Contains(raw, "data:") {
+				if evs, err := cassette.DecodeSSE(strings.NewReader(raw)); err == nil && len(evs) > 0 {
+					sum := cassette.ReconstructStreamSummary(evs)
+					for _, tc := range sum.ToolCalls {
+						addTool(tc.Name)
+					}
+				}
 			}
 		}
 	}
@@ -635,17 +754,43 @@ func ExtractObservedTools(cas *cassette.Cassette, filterIDs map[string]bool) []s
 	return out
 }
 
+func extractMCPRequestToolName(req *cassette.Request, addTool func(string)) {
+	if req == nil {
+		return
+	}
+	extractFromMap := func(m map[string]interface{}) {
+		if name, ok := m["name"].(string); ok {
+			addTool(name)
+		}
+		if params, ok := m["params"].(map[string]interface{}); ok {
+			if name, ok := params["name"].(string); ok {
+				addTool(name)
+			}
+		}
+	}
+	if m, ok := req.Body.(map[string]interface{}); ok {
+		extractFromMap(m)
+		return
+	}
+	if raw := strings.TrimSpace(req.RawBody); len(raw) > 0 && raw[0] == '{' {
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(raw), &m) == nil {
+			extractFromMap(m)
+		}
+	}
+}
+
 func extractToolsFromJSONBody(body interface{}, addTool func(string)) {
 	m, ok := body.(map[string]interface{})
 	if !ok {
 		return
 	}
-	// Anthropic: content[].type == "tool_use" | "server_tool_use"
+	// Anthropic: content[].type == "tool_use" | "server_tool_use" | "mcp_tool_use"
 	if content, ok := m["content"].([]interface{}); ok {
 		for _, item := range content {
 			if block, ok := item.(map[string]interface{}); ok {
 				bType, _ := block["type"].(string)
-				if bType == "tool_use" || bType == "server_tool_use" {
+				if bType == "tool_use" || bType == "server_tool_use" || bType == "mcp_tool_use" {
 					if name, ok := block["name"].(string); ok {
 						addTool(name)
 					}
@@ -653,7 +798,7 @@ func extractToolsFromJSONBody(body interface{}, addTool func(string)) {
 			}
 		}
 	}
-	// OpenAI: choices[].message.tool_calls[].function.name
+	// OpenAI Chat Completions: choices[].message.tool_calls[].function.name and legacy function_call.name
 	if choices, ok := m["choices"].([]interface{}); ok {
 		for _, item := range choices {
 			cMap, ok := item.(map[string]interface{})
@@ -663,6 +808,11 @@ func extractToolsFromJSONBody(body interface{}, addTool func(string)) {
 			msg, ok := cMap["message"].(map[string]interface{})
 			if !ok {
 				continue
+			}
+			if fc, ok := msg["function_call"].(map[string]interface{}); ok {
+				if name, ok := fc["name"].(string); ok {
+					addTool(name)
+				}
 			}
 			tcs, ok := msg["tool_calls"].([]interface{})
 			if !ok {
@@ -677,6 +827,21 @@ func extractToolsFromJSONBody(body interface{}, addTool func(string)) {
 					if name, ok := fn["name"].(string); ok {
 						addTool(name)
 					}
+				}
+			}
+		}
+	}
+	// OpenAI Responses API: output[].type == "function_call" | "mcp_call"
+	if output, ok := m["output"].([]interface{}); ok {
+		for _, item := range output {
+			oMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			oType, _ := oMap["type"].(string)
+			if oType == "function_call" || oType == "mcp_call" {
+				if name, ok := oMap["name"].(string); ok {
+					addTool(name)
 				}
 			}
 		}
@@ -712,10 +877,11 @@ func extractToolsFromJSONBody(body interface{}, addTool func(string)) {
 }
 
 func resolvePath(baseDir, p string) string {
-	if filepath.IsAbs(p) || baseDir == "" {
-		return p
+	norm := filepath.FromSlash(strings.TrimSpace(p))
+	if filepath.IsAbs(norm) || baseDir == "" {
+		return norm
 	}
-	return filepath.Join(baseDir, p)
+	return filepath.Join(baseDir, norm)
 }
 
 func resolveMode(c CaseSpec) string {
@@ -776,7 +942,7 @@ func buildTimeout(c CaseSpec, d CaseDefaults) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid timeout %q: %w", raw, err)
 	}
 	if dur <= 0 {
-		return 60 * time.Second, nil
+		return 0, fmt.Errorf("timeout must be > 0 (got %q)", raw)
 	}
 	return dur, nil
 }

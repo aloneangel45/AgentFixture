@@ -24,13 +24,13 @@ import (
 )
 
 func TestCLI_VersionFormattingNoDoubleV(t *testing.T) {
-	if got := formatVersionString("v1.3.0"); !strings.Contains(got, "AgentFixture v1.3.0") || strings.Contains(got, "vv1.3.0") {
-		t.Fatalf("unexpected version formatting for v1.3.0: %q", got)
+	if got := formatVersionString("v1.3.1"); !strings.Contains(got, "AgentFixture v1.3.1") || strings.Contains(got, "vv1.3.1") {
+		t.Fatalf("unexpected version formatting for v1.3.1: %q", got)
 	}
-	if got := formatVersionString("1.3.0"); !strings.Contains(got, "AgentFixture v1.3.0") {
-		t.Fatalf("unexpected version formatting for 1.3.0: %q", got)
+	if got := formatVersionString("1.3.1"); !strings.Contains(got, "AgentFixture v1.3.1") {
+		t.Fatalf("unexpected version formatting for 1.3.1: %q", got)
 	}
-	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.3.0") {
+	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.3.1") {
 		t.Fatalf("unexpected empty fallback version formatting: %q", got)
 	}
 }
@@ -678,7 +678,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	// Build a tiny real zip containing a compiled Windows helper binary that prints version
 	tmpDir := t.TempDir()
 	binSrc := filepath.Join(tmpDir, "stub.go")
-	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.3.0 (installer-test)\") }\n"), 0644); err != nil {
+	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.3.1 (installer-test)\") }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	builtExe := filepath.Join(tmpDir, "agentfixture.exe")
@@ -743,7 +743,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install.ps1 failed on valid SHA-256 archive: %v\nOutput:\n%s", err, string(outOK))
 	}
-	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.3.0") {
+	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.3.1") {
 		t.Errorf("unexpected install.ps1 output:\n%s", string(outOK))
 	}
 	destExeOK := filepath.Join(installDirOK, "agentfixture.exe")
@@ -1148,5 +1148,192 @@ cases:
 	// Directory mode directly on tmpDir (skips suite.yaml automatically!)
 	if err := handleTest([]string{"-concurrency", "2", tmpDir}); err != nil {
 		t.Fatalf("handleTest directory mode failed: %v", err)
+	}
+}
+
+func TestCLI_V131_HardeningPermutationsBudgetsJUnitAndNewEpisodes(t *testing.T) {
+	if os.Getenv("AGENTFIXTURE_V131_HELPER") == "one_call" {
+		baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+		resp, err := http.Post(baseURL+"/v1/messages", "application/json", strings.NewReader(`{"prompt":"brand_new_ep"}`))
+		if err != nil {
+			os.Exit(2)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
+
+	tmpDir := t.TempDir()
+	casDir := filepath.Join(tmpDir, "fixtures")
+	if err := os.MkdirAll(casDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mkCas := func(id string, inTok int) *cassette.Cassette {
+		c := cassette.NewCassette(id)
+		c.Metadata.Model = "claude-sonnet-4-5"
+		c.Interactions = append(c.Interactions, cassette.Interaction{
+			ID:       "int_001",
+			Sequence: 1,
+			Type:     cassette.InteractionTypeHTTP,
+			Request:  cassette.Request{Method: "POST", Endpoint: "/v1/messages", RawBody: `{"prompt":"brand_new_ep"}`},
+			Response: cassette.Response{
+				StatusCode: 200,
+				Headers:    map[string]string{"Content-Type": "application/json"},
+				RawBody:    `{"ok":true}`,
+				Usage:      cassette.Usage{InputTokens: inTok, OutputTokens: 100},
+			},
+		})
+		return c
+	}
+
+	cas1Path := filepath.Join(casDir, "c1.yaml")
+	cas2Path := filepath.Join(casDir, "c2.yaml")
+	if err := cassette.Save(cas1Path, mkCas("c1", 600)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cassette.Save(cas2Path, mkCas("c2", 600)); err != nil {
+		t.Fatal(err)
+	}
+	origBytes, err := os.ReadFile(cas1Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Trailing value flag missing its argument MUST fail and MUST NOT steal/overwrite positional cassette!
+	if err := handleVerify([]string{cas1Path, "-junit"}); err == nil {
+		t.Fatalf("expected error when trailing -junit flag has no value")
+	}
+	if err := handleRedact([]string{cas1Path, "-out"}); err == nil {
+		t.Fatalf("expected error when trailing -out flag has no value")
+	}
+	afterBytes, _ := os.ReadFile(cas1Path)
+	if !bytes.Equal(origBytes, afterBytes) {
+		t.Fatalf("trailing missing-arg flag corrupted positional cassette file!")
+	}
+
+	// 2. handleTest rejects -concurrency <= 0
+	if err := handleTest([]string{"-concurrency", "0", casDir}); err == nil {
+		t.Fatalf("expected error for -concurrency 0")
+	}
+	if err := handleTest([]string{"-concurrency", "-3", casDir}); err == nil {
+		t.Fatalf("expected error for -concurrency -3")
+	}
+
+	// 3. handleReplay rejects invalid chaos/matcher/threshold/delay-scale/mcp+record-mode combinations
+	badReplayArgs := [][]string{
+		{"-cassette", cas1Path, "-mcp", "-record-mode", "new_episodes", "-upstream", "http://127.0.0.1:9"},
+		{"-cassette", cas1Path, "-matcher", "invalid_matcher"},
+		{"-cassette", cas1Path, "-threshold", "1.5"},
+		{"-cassette", cas1Path, "-threshold", "NaN"},
+		{"-cassette", cas1Path, "-delay-scale", "-1"},
+		{"-cassette", cas1Path, "-delay-scale", "NaN"},
+		{"-cassette", cas1Path, "-max-delay", "-1s"},
+		{"-cassette", cas1Path, "-chaos-latency-ms", "-10"},
+		{"-cassette", cas1Path, "-chaos-error-rate", "NaN"},
+		{"-cassette", cas1Path, "-chaos-error-rate", "1.2"},
+		{"-cassette", cas1Path, "-max-cost-usd", "NaN"},
+	}
+	for i, args := range badReplayArgs {
+		if err := handleReplay(args); err == nil {
+			t.Errorf("badReplayArgs[%d] (%v): expected error, got nil", i, args)
+		}
+	}
+
+	// 4. handleReplay -record-mode new_episodes on a BRAND-NEW non-existent cassette creates & saves it!
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"claude-sonnet-4-5","usage":{"input_tokens":500,"output_tokens":100}}`))
+	}))
+	defer upstream.Close()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	brandNewCas := filepath.Join(tmpDir, "does_not_exist_yet.yaml")
+	t.Setenv("AGENTFIXTURE_V131_HELPER", "one_call")
+	if err := handleReplay([]string{
+		"-cassette", brandNewCas,
+		"-record-mode", "new_episodes",
+		"-upstream", upstream.URL,
+		"--",
+		exe, "-test.run=^TestCLI_V131_HardeningPermutationsBudgetsJUnitAndNewEpisodes$",
+	}); err != nil {
+		t.Fatalf("handleReplay -record-mode=new_episodes on non-existent cassette failed: %v", err)
+	}
+	if created, loadErr := cassette.Load(brandNewCas); loadErr != nil || len(created.Interactions) != 1 {
+		t.Fatalf("expected newly created hybrid cassette with 1 interaction, got cas=%v err=%v", created, loadErr)
+	}
+
+	// 5. Aggregate budget failure in verify <dir> -junit, test -junit, and replay -junit MUST record JUnit failures >= 1!
+	// Each cassette has 700 tokens (total 1400 > 1000), so individually each passes <=1000, but aggregate fails!
+	verifyJUnit := filepath.Join(tmpDir, "verify-agg-budget.xml")
+	if err := handleVerify([]string{"-max-tokens", "1000", "-junit", verifyJUnit, casDir}); err == nil {
+		t.Fatalf("expected directory verify to fail on aggregate max-tokens 1000")
+	}
+	var vSuites junit.TestSuites
+	vXML, err := os.ReadFile(verifyJUnit)
+	if err != nil {
+		t.Fatalf("failed to read verify aggregate budget JUnit: %v", err)
+	}
+	if err := xml.Unmarshal(vXML, &vSuites); err != nil {
+		t.Fatalf("invalid verify JUnit XML: %v", err)
+	}
+	if vSuites.Failures < 1 || !strings.Contains(string(vXML), "BudgetViolation") {
+		t.Fatalf("expected verify JUnit to contain BudgetViolation failure, got failures=%d:\n%s", vSuites.Failures, string(vXML))
+	}
+
+	// Suite test with special XML chars & control bytes in suite/case names + aggregate budget breach
+	suitePath := filepath.Join(tmpDir, "suite_xml_budget.yaml")
+	suiteBody := "version: agentfixture/suite/v1\nname: \"suite <a&b> 'q'\"\ncases:\n  - name: \"case <1> & \\\"2\\\"\"\n    cassette: fixtures/c1.yaml\n    mode: verify\n  - name: \"case_two\"\n    cassette: fixtures/c2.yaml\n    mode: verify\n"
+	if err := os.WriteFile(suitePath, []byte(suiteBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+	suiteJUnit := filepath.Join(tmpDir, "suite-agg-budget.xml")
+	_, suiteErr := captureStdout(t, func() error {
+		return handleTest([]string{"-json", "-max-tokens", "1000", "-junit", suiteJUnit, suitePath})
+	})
+	if suiteErr == nil || !strings.Contains(suiteErr.Error(), "budget") {
+		t.Fatalf("expected suite -json error mentioning budget, got: %v", suiteErr)
+	}
+	sXML, err := os.ReadFile(suiteJUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sSuites junit.TestSuites
+	if err := xml.Unmarshal(sXML, &sSuites); err != nil {
+		t.Fatalf("invalid suite JUnit XML with special chars: %v\n%s", err, string(sXML))
+	}
+	if sSuites.Failures < 1 || !strings.Contains(string(sXML), "suite_budget") {
+		t.Fatalf("expected suite JUnit to record suite_budget failure, got failures=%d:\n%s", sSuites.Failures, string(sXML))
+	}
+
+	// Replay budget failure writes BudgetViolation into JUnit XML!
+	replayJUnit := filepath.Join(tmpDir, "replay-budget.xml")
+	t.Setenv("AGENTFIXTURE_V131_HELPER", "one_call")
+	if err := handleReplay([]string{
+		"-cassette", cas1Path,
+		"-max-tokens", "100",
+		"-junit", replayJUnit,
+		"--",
+		exe, "-test.run=^TestCLI_V131_HardeningPermutationsBudgetsJUnitAndNewEpisodes$",
+	}); err == nil {
+		t.Fatalf("expected handleReplay to fail when -max-tokens is exceeded")
+	}
+	rXML, err := os.ReadFile(replayJUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rSuites junit.TestSuites
+	if err := xml.Unmarshal(rXML, &rSuites); err != nil {
+		t.Fatalf("invalid replay JUnit XML: %v", err)
+	}
+	if rSuites.Failures < 1 || !strings.Contains(string(rXML), "BudgetViolation") {
+		t.Fatalf("expected replay JUnit to contain BudgetViolation failure, got failures=%d:\n%s", rSuites.Failures, string(rXML))
 	}
 }

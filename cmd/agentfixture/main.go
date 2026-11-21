@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,7 +29,7 @@ import (
 )
 
 // Version is injected at build time via -ldflags="-X main.Version=...".
-var Version = "1.3.0"
+var Version = "1.3.1"
 
 const (
 	ProgramName = "AgentFixture"
@@ -82,17 +83,27 @@ func main() {
 func formatVersionString(ver string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(ver), "v")
 	if clean == "" {
-		clean = "1.3.0"
+		clean = "1.3.1"
 	}
 	return fmt.Sprintf("%s v%s (%s)", ProgramName, clean, Banner)
 }
 
+// parseFlagsPermuted reorders flags before positional arguments (preserving `--` termination)
+// and parses fs without ever letting a trailing value flag steal an earlier positional argument.
+func parseFlagsPermuted(fs *flag.FlagSet, args []string) error {
+	reordered, err := permuteFlagsFirst(fs, args)
+	if err != nil {
+		return err
+	}
+	return fs.Parse(reordered)
+}
+
 // permuteFlagsFirst reorders args so flags (and their values) precede positional arguments,
 // allowing idiomatic CLI invocations such as `agentfixture verify fixtures/ -json -junit out.xml`
-// while preserving `--` argument termination.
-func permuteFlagsFirst(fs *flag.FlagSet, args []string) []string {
+// while preserving `--` argument termination and rejecting value flags missing their argument.
+func permuteFlagsFirst(fs *flag.FlagSet, args []string) ([]string, error) {
 	if len(args) == 0 {
-		return args
+		return args, nil
 	}
 	flags := make([]string, 0, len(args))
 	positional := make([]string, 0, len(args))
@@ -124,13 +135,13 @@ func permuteFlagsFirst(fs *flag.FlagSet, args []string) []string {
 			flags = append(flags, arg)
 			continue
 		}
-		flags = append(flags, arg)
-		if i+1 < len(args) {
-			i++
-			flags = append(flags, args[i])
+		if i+1 >= len(args) || args[i+1] == "--" {
+			return nil, fmt.Errorf("flag needs an argument: %s", arg)
 		}
+		flags = append(flags, arg, args[i+1])
+		i++
 	}
-	return append(flags, positional...)
+	return append(flags, positional...), nil
 }
 
 func printVersion() {
@@ -394,7 +405,7 @@ func handleVerify(args []string) error {
 	jsonOut := flagSet.Bool("json", false, "Emit structured JSON verification report")
 	junitPath := flagSet.String("junit", "", "Write JUnit XML verification report to path")
 	bFlags := registerBudgetFlags(flagSet)
-	if err := flagSet.Parse(permuteFlagsFirst(flagSet, args)); err != nil {
+	if err := parseFlagsPermuted(flagSet, args); err != nil {
 		return err
 	}
 
@@ -586,7 +597,16 @@ func handleVerify(args []string) error {
 	rep.Passed = rep.FailedCassettes == 0 && rep.Budget.Passed
 
 	if *junitPath != "" {
-		suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases(rep.Results), rep.EstimatedTokensSaved, rep.EstimatedCostSavedUSD, time.Since(suiteStart))
+		jCases := toJUnitVerifyCases(rep.Results)
+		if !rep.Budget.Passed {
+			jCases = append(jCases, junit.VerifyCaseInput{
+				Path:      filepath.ToSlash(targetPath) + "#budget",
+				Valid:     false,
+				ErrorType: "BudgetViolation",
+				Error:     "batch budget check failed: " + rep.Budget.ViolationSummary(),
+			})
+		}
+		suites := junit.BuildVerifySuites(targetPath, jCases, rep.EstimatedTokensSaved, rep.EstimatedCostSavedUSD, time.Since(suiteStart))
 		if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
 			return wErr
 		}
@@ -667,7 +687,7 @@ type inspectReport struct {
 func handleInspect(args []string) error {
 	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "Emit structured JSON telemetry")
-	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 
@@ -764,7 +784,7 @@ func handleInspect(args []string) error {
 func handleRedact(args []string) error {
 	fs := flag.NewFlagSet("redact", flag.ContinueOnError)
 	outPath := fs.String("out", "", "Destination path (defaults to in-place overwrite)")
-	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 
@@ -819,7 +839,7 @@ func handleImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	tpPath := fs.String("traceport", "", "Path to TracePort flight recording JSON file")
 	outPath := fs.String("out", "cassette.yaml", "Output path for the generated cassette file")
-	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 
@@ -843,7 +863,7 @@ func handleImport(args []string) error {
 func handleDiff(args []string) error {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	exitCode := fs.Bool("exit-code", false, "Exit with non-zero status code when differences are found")
-	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
 	}
 
@@ -1013,7 +1033,7 @@ func handleRecord(args []string) error {
 	recordModeStr := fs.String("record-mode", "all", "Record mode: all (default), new_episodes (keep existing and record unmatched), or none")
 
 	flagArgs, cmdArgs := splitDashArgs(args)
-	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
+	if err := parseFlagsPermuted(fs, flagArgs); err != nil {
 		return err
 	}
 
@@ -1044,7 +1064,7 @@ func handleRecord(args []string) error {
 	if recordMode == proxy.RecordModeNewEpisodes {
 		if existing, loadErr := cassette.Load(*casPath); loadErr == nil {
 			cas = existing
-		} else if !os.IsNotExist(loadErr) {
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
 			return fmt.Errorf("failed to load existing cassette for new_episodes: %w", loadErr)
 		}
 	} else if recordMode == proxy.RecordModeNone {
@@ -1137,7 +1157,7 @@ func handleReplay(args []string) error {
 	bFlags := registerBudgetFlags(fs)
 
 	flagArgs, cmdArgs := splitDashArgs(args)
-	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
+	if err := parseFlagsPermuted(fs, flagArgs); err != nil {
 		return err
 	}
 
@@ -1149,8 +1169,25 @@ func handleReplay(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *mcpMode && recordMode != proxy.RecordModeNone {
+		return fmt.Errorf("-record-mode=%s is not supported with -mcp replay (use 'agentfixture record -mcp' to record MCP stdio servers)", recordMode)
+	}
 	if (recordMode == proxy.RecordModeNewEpisodes || recordMode == proxy.RecordModeAll) && strings.TrimSpace(*upstream) == "" {
 		return fmt.Errorf("-upstream <url> is required when -record-mode=%s", recordMode)
+	}
+
+	normMatcher := strings.ToLower(strings.TrimSpace(*matcherType))
+	if normMatcher != "" && normMatcher != "strict" && normMatcher != "fuzzy" {
+		return fmt.Errorf("unsupported -matcher %q (expected strict or fuzzy)", *matcherType)
+	}
+	if math.IsNaN(*threshold) || math.IsInf(*threshold, 0) || *threshold < 0 || *threshold > 1.0 {
+		return fmt.Errorf("-threshold must be between 0.0 and 1.0 (got %v)", *threshold)
+	}
+	if math.IsNaN(*delayScale) || math.IsInf(*delayScale, 0) || *delayScale < 0 {
+		return fmt.Errorf("-delay-scale must be a finite number >= 0 (got %v)", *delayScale)
+	}
+	if *maxDelay < 0 {
+		return fmt.Errorf("-max-delay must be >= 0 (got %v)", *maxDelay)
 	}
 
 	chaosInj, err := cFlags.buildInjector()
@@ -1182,7 +1219,7 @@ func handleReplay(args []string) error {
 	case proxy.RecordModeNewEpisodes:
 		cas, err = cassette.Load(*casPath)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				cas = cassette.NewCassette(fmt.Sprintf("cas_hybrid_%d", time.Now().Unix()))
 				cas.Metadata.Source = "agentfixture_hybrid_proxy"
 				casExisted = false
@@ -1268,6 +1305,7 @@ func handleReplay(args []string) error {
 		bRep := budget.Evaluate(cas, pricingTable, thresholds)
 		if !bRep.Passed {
 			report.Passed = false
+			report.BudgetViolation = bRep.ViolationSummary()
 		}
 
 		if *junitPath != "" {
@@ -1360,8 +1398,11 @@ func handleTest(args []string) error {
 	junitPath := fs.String("junit", "", "Write JUnit XML suite report to path")
 	bFlags := registerBudgetFlags(fs)
 
-	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+	if err := parseFlagsPermuted(fs, args); err != nil {
 		return err
+	}
+	if *concurrency <= 0 {
+		return fmt.Errorf("-concurrency must be >= 1 (got %d)", *concurrency)
 	}
 
 	thresholds, pricingTable, summaryPath, err := bFlags.resolve()
@@ -1429,6 +1470,18 @@ func handleTest(args []string) error {
 				Failures:         c.Failures,
 			})
 		}
+		if !report.Budget.Passed {
+			jCases = append(jCases, junit.SuiteCaseInput{
+				Name:             "suite_budget",
+				Cassette:         report.Source,
+				Mode:             "budget",
+				Passed:           false,
+				TotalTokens:      report.Budget.TotalTokens,
+				EstimatedCostUSD: report.Budget.EstimatedCostUSD,
+				CacheHitRate:     report.Budget.CacheHitRate,
+				Failures:         []string{"budget: " + report.Budget.ViolationSummary()},
+			})
+		}
 		jSuites := junit.BuildSuiteSuites(report.Name, jCases, report.Budget.TotalTokens, report.Budget.EstimatedCostUSD, report.Budget.CacheHitRate, report.Duration)
 		if wErr := junit.WriteFile(*junitPath, jSuites); wErr != nil {
 			return wErr
@@ -1448,6 +1501,9 @@ func handleTest(args []string) error {
 			return encErr
 		}
 		if !report.Passed {
+			if report.FailedCases == 0 && !report.Budget.Passed {
+				return fmt.Errorf("test suite budget failed: %s", report.Budget.ViolationSummary())
+			}
 			return fmt.Errorf("test suite failed: %d of %d case(s) failed", report.FailedCases, report.TotalCases)
 		}
 		return nil

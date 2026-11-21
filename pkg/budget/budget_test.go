@@ -232,3 +232,160 @@ func TestGitHubStepSummaryAppend(t *testing.T) {
 		t.Fatalf("unexpected GitHub summary markdown:\n%s", text)
 	}
 }
+
+func TestBudget_ZeroTokensCacheHitRateAndNaNInfValidation(t *testing.T) {
+	// 1. Cassette with 0 tokens + MinCacheHitRate 0.5 -> CacheHitRate must be 0 (not NaN) and fail deterministically
+	emptyCas := cassette.NewCassette("cas_zero_tokens")
+	emptyCas.Interactions = append(emptyCas.Interactions, cassette.Interaction{
+		ID:       "int_empty",
+		Sequence: 1,
+		Type:     cassette.InteractionTypeTool,
+		Response: cassette.Response{StatusCode: 0, ToolResult: "ok"},
+	})
+	rep := Evaluate(emptyCas, DefaultPricingTable(), Thresholds{MinCacheHitRate: 0.5})
+	if math.IsNaN(rep.CacheHitRate) || math.IsInf(rep.CacheHitRate, 0) || rep.CacheHitRate != 0 {
+		t.Fatalf("expected CacheHitRate=0 on zero-token cassette, got %v", rep.CacheHitRate)
+	}
+	if rep.Passed || len(rep.Violations) != 1 || !strings.Contains(rep.Violations[0].Message, "no prompt tokens recorded") {
+		t.Fatalf("expected crisp min_cache_hit_rate violation on zero-token cassette, got passed=%v violations=%+v", rep.Passed, rep.Violations)
+	}
+
+	// 2. Malformed negative token counts are clamped to 0 (never produce negative cost or totals)
+	negCas := cassette.NewCassette("cas_neg_tokens")
+	negCas.Interactions = append(negCas.Interactions, cassette.Interaction{
+		ID:       "int_neg",
+		Sequence: 1,
+		Type:     cassette.InteractionTypeHTTP,
+		Response: cassette.Response{
+			StatusCode: 200,
+			Usage:      cassette.Usage{InputTokens: -500, OutputTokens: -100, CacheReadInputTokens: -50},
+		},
+	})
+	negRep := Evaluate(negCas, DefaultPricingTable(), Thresholds{})
+	if negRep.TotalTokens != 0 || negRep.EstimatedCostUSD != 0 || negRep.CacheHitRate != 0 {
+		t.Fatalf("expected negative tokens clamped to 0, got %+v", negRep)
+	}
+
+	// 3. Thresholds.Validate rejects NaN, Inf, and out-of-range values
+	badThresholds := []Thresholds{
+		{MaxTokens: -1},
+		{MaxCostUSD: -0.01},
+		{MaxCostUSD: math.NaN()},
+		{MaxCostUSD: math.Inf(1)},
+		{MaxCostUSD: math.Inf(-1)},
+		{MinCacheHitRate: -0.1},
+		{MinCacheHitRate: 1.01},
+		{MinCacheHitRate: math.NaN()},
+		{MinCacheHitRate: math.Inf(1)},
+	}
+	for i, th := range badThresholds {
+		if err := th.Validate(); err == nil {
+			t.Errorf("threshold case %d (%+v): expected validation error, got nil", i, th)
+		}
+	}
+}
+
+func TestPricingFile_ValidationAndCompoundPrefixNormalization(t *testing.T) {
+	// Reject NaN/Inf/negative rates via validatePricingRate
+	badRates := []struct {
+		name string
+		rate ModelPricing
+	}{
+		{"", ModelPricing{InputPerMillion: 1}},
+		{"models/", ModelPricing{InputPerMillion: 1}},
+		{"anthropic/", ModelPricing{InputPerMillion: 1}},
+		{"m1", ModelPricing{InputPerMillion: -1}},
+		{"m2", ModelPricing{OutputPerMillion: math.NaN()}},
+		{"m3", ModelPricing{CacheReadPerMillion: math.Inf(1)}},
+		{"m4", ModelPricing{CacheWritePerMillion: math.Inf(-1)}},
+	}
+	for _, tc := range badRates {
+		if err := validatePricingRate(tc.name, tc.rate); err == nil {
+			t.Errorf("validatePricingRate(%q, %+v): expected error, got nil", tc.name, tc.rate)
+		}
+	}
+
+	// LoadPricingFile rejects negative prices and JSON null
+	dir := t.TempDir()
+	negPath := filepath.Join(dir, "neg.json")
+	if err := os.WriteFile(negPath, []byte(`{"gpt-5":{"input_per_million":-2.0}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPricingFile(negPath); err == nil {
+		t.Fatalf("expected LoadPricingFile to reject negative price")
+	}
+
+	nullPath := filepath.Join(dir, "null.json")
+	if err := os.WriteFile(nullPath, []byte(`null`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPricingFile(nullPath); err == nil {
+		t.Fatalf("expected LoadPricingFile to reject JSON null")
+	}
+
+	// Compound/uppercase provider prefix normalization
+	tbl := DefaultPricingTable()
+	for _, tc := range []struct {
+		raw     string
+		wantKey string
+	}{
+		{"MODELS/GEMINI-2.5-PRO", "gemini-2.5-pro"},
+		{"GOOGLE/MODELS/GEMINI-2.5-PRO", "gemini-2.5-pro"},
+		{"ANTHROPIC/CLAUDE-SONNET-4-5", "claude-sonnet-4-5"},
+		{"projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.5-flash-001", "gemini-2.5-flash"},
+		{"OPENAI/GPT-4O-2024-11-20", "gpt-4o"},
+	} {
+		_, key, ok := tbl.Lookup(tc.raw)
+		if !ok || key != tc.wantKey {
+			t.Errorf("Lookup(%q) = (%q, %v), want (%q, true)", tc.raw, key, ok, tc.wantKey)
+		}
+	}
+}
+
+func TestGitHubStepSummary_MarkdownEscaping(t *testing.T) {
+	md := FormatSummaryMarkdown("Suite\nInjection", []SummaryRow{
+		{
+			Name:         "dir/case`with|pipe\r\nand\nnewline.yaml",
+			Passed:       false,
+			Interactions: 1,
+			TotalTokens:  10,
+			CostUSD:      0.001,
+			CacheHitRate: 0,
+			Details:      "err | pipe\r\nsecond line",
+		},
+		{
+			Name:         "`leading_backtick`",
+			Passed:       true,
+			Interactions: 1,
+			TotalTokens:  10,
+			CostUSD:      0.001,
+			CacheHitRate: 0.5,
+			Details:      "ok",
+		},
+	}, Report{
+		InteractionCount: 2,
+		TotalTokens:      20,
+		EstimatedCostUSD: 0.002,
+		Passed:           false,
+		Violations: []Violation{
+			{Metric: "max_tokens", Message: "line1\nline2"},
+		},
+	}, false)
+
+	// Verify title and every table row stay single-line with escaped pipes and multi-backtick code fences
+	if strings.Contains(md, "## AgentFixture Suite\nInjection") {
+		t.Fatalf("newline in title was not sanitized:\n%s", md)
+	}
+	if !strings.Contains(md, "``dir/case`with\\|pipe and newline.yaml``") {
+		t.Fatalf("expected multi-backtick fenced and pipe/newline-escaped name cell, got:\n%s", md)
+	}
+	if !strings.Contains(md, "`` `leading_backtick` ``") {
+		t.Fatalf("expected space-padded multi-backtick fence for leading/trailing backticks, got:\n%s", md)
+	}
+	if !strings.Contains(md, `err \| pipe second line`) {
+		t.Fatalf("expected pipe and CRLF escaped in notes cell, got:\n%s", md)
+	}
+	if strings.Contains(md, "\r") {
+		t.Fatalf("markdown summary must not contain stray CR characters:\n%q", md)
+	}
+}

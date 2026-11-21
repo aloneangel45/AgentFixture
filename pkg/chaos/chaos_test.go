@@ -3,6 +3,7 @@ package chaos
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -182,5 +183,25 @@ func TestSleepContextCancel(t *testing.T) {
 	}
 	if err := SleepContext(context.Background(), 0); err != nil {
 		t.Fatalf("expected nil for zero duration, got %v", err)
+	}
+}
+
+func TestConfigValidation_NaNInfAndLatencyOverflow(t *testing.T) {
+	invalid := []Config{
+		{ErrorRate: math.NaN()},
+		{ErrorRate: math.Inf(1)},
+		{ErrorRate: math.Inf(-1)},
+		{LatencyMs: math.MaxInt64},
+		{LatencyMs: MaxLatencyMs + 1},
+		{LatencyJitterMs: math.MaxInt64},
+		{LatencyJitterMs: MaxLatencyMs + 1},
+	}
+	for i, cfg := range invalid {
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("case %d (%+v): expected validation error, got nil", i, cfg)
+		}
+		if _, err := NewInjector(cfg); err == nil {
+			t.Errorf("case %d (%+v): expected NewInjector error, got nil", i, cfg)
+		}
 	}
 }
