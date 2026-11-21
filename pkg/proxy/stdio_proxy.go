@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 )
 
@@ -57,6 +58,7 @@ type StdioReplayer struct {
 	cas        *cassette.Cassette
 	matcher    matcher.Matcher
 	matchedIDs map[string]bool
+	chaos      *chaos.Injector
 }
 
 // NewStdioReplayer creates an initialized StdioReplayer.
@@ -72,6 +74,21 @@ func NewStdioReplayer(cas *cassette.Cassette, m matcher.Matcher) *StdioReplayer 
 		matcher:    m,
 		matchedIDs: make(map[string]bool),
 	}
+}
+
+// SetChaos attaches a deterministic chaos.Injector for JSON-RPC -32000 fault & latency injection.
+func (sr *StdioReplayer) SetChaos(inj *chaos.Injector) {
+	sr.mu.Lock()
+	sr.chaos = inj
+	sr.mu.Unlock()
+}
+
+// ChaosStats returns a snapshot of chaos faults injected during MCP stdio replay.
+func (sr *StdioReplayer) ChaosStats() chaos.Stats {
+	sr.mu.Lock()
+	inj := sr.chaos
+	sr.mu.Unlock()
+	return inj.Stats()
 }
 
 // MatchedCount returns how many unique cassette interactions have been replayed.
@@ -270,6 +287,23 @@ func (sr *StdioReplayer) processJSONRPCObject(rawBytes []byte, rawObj map[string
 }
 
 func (sr *StdioReplayer) evaluateJSONRPC(rpcReq JSONRPCRequest) JSONRPCResponse {
+	sr.mu.Lock()
+	inj := sr.chaos
+	sr.mu.Unlock()
+	if inj != nil && inj.Enabled() {
+		dec := inj.Evaluate()
+		if dec.Latency > 0 {
+			time.Sleep(dec.Latency)
+		}
+		if dec.Fault != chaos.FaultNone {
+			return JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      rpcReq.ID,
+				Error:   chaos.JSONRPCFaultError(dec.Fault),
+			}
+		}
+	}
+
 	var toolName string
 	var toolArgs map[string]interface{}
 

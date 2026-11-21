@@ -349,6 +349,83 @@ func BuildMCPReplaySuites(cas *cassette.Cassette, casPath string, duration time.
 	}
 }
 
+// SuiteCaseInput describes the execution result of one declarative test suite case for JUnit conversion.
+type SuiteCaseInput struct {
+	Name             string
+	Cassette         string
+	Mode             string
+	Passed           bool
+	Interactions     int
+	Turns            int
+	TotalTokens      int64
+	EstimatedCostUSD float64
+	CacheHitRate     float64
+	Duration         time.Duration
+	Failures         []string
+}
+
+// BuildSuiteSuites constructs a standard JUnit XML report for `agentfixture test` parallel suite runs.
+func BuildSuiteSuites(suiteName string, cases []SuiteCaseInput, totalTokens int64, totalCostUSD float64, cacheHitRate float64, totalDuration time.Duration) TestSuites {
+	cleanName := sanitizeXMLText(suiteName)
+	if cleanName == "" {
+		cleanName = "default"
+	}
+	suite := TestSuite{
+		Name:      "agentfixture.test." + cleanName,
+		Time:      formatSeconds(totalDuration),
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Properties: &Properties{
+			Items: []Property{
+				{Name: "suite_name", Value: cleanName},
+				{Name: "total_tokens", Value: fmt.Sprintf("%d", totalTokens)},
+				{Name: "estimated_cost_usd", Value: fmt.Sprintf("%.4f", totalCostUSD)},
+				{Name: "cache_hit_rate", Value: fmt.Sprintf("%.4f", cacheHitRate)},
+			},
+		},
+		TestCases: make([]TestCase, 0, maxInt(1, len(cases))),
+	}
+
+	for _, c := range cases {
+		normPath := sanitizeXMLText(normalizeSlashPath(c.Cassette))
+		tc := TestCase{
+			Name:      sanitizeXMLText(c.Name),
+			ClassName: "agentfixture.test." + cleanName,
+			File:      normPath,
+			Time:      formatSeconds(c.Duration),
+		}
+		if c.Passed {
+			tc.SystemOut = sanitizeXMLText(fmt.Sprintf(
+				"mode=%s interactions=%d turns=%d tokens=%d cost_usd=%.4f cache_hit_rate=%.1f%%",
+				c.Mode, c.Interactions, c.Turns, c.TotalTokens, c.EstimatedCostUSD, c.CacheHitRate*100,
+			))
+		} else {
+			reason := "suite case failed"
+			if len(c.Failures) > 0 {
+				reason = strings.Join(c.Failures, "; ")
+			}
+			msg := sanitizeXMLText(reason)
+			tc.Failure = &Failure{
+				Message: msg,
+				Type:    "SuiteAssertionError",
+				Body:    sanitizeXMLText(fmt.Sprintf("Case: %s\nCassette: %s\nMode: %s\nFailures:\n- %s", c.Name, normPath, c.Mode, strings.Join(c.Failures, "\n- "))),
+			}
+			suite.Failures++
+		}
+		suite.TestCases = append(suite.TestCases, tc)
+	}
+
+	suite.Tests = len(suite.TestCases)
+	return TestSuites{
+		Name:     "AgentFixture Test Suite",
+		Tests:    suite.Tests,
+		Failures: suite.Failures,
+		Errors:   suite.Errors,
+		Skipped:  suite.Skipped,
+		Time:     suite.Time,
+		Suites:   []TestSuite{suite},
+	}
+}
+
 // Marshal encodes TestSuites into UTF-8 JUnit XML bytes with a standard XML declaration header.
 func Marshal(suites TestSuites) ([]byte, error) {
 	var buf bytes.Buffer

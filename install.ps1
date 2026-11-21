@@ -1,7 +1,7 @@
 # AgentFixture Universal PowerShell One-Line Installer (Windows amd64/arm64)
 # Usage:
 #   irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
-#   $env:AGENTFIXTURE_VERSION = "v1.2.2"; irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
+#   $env:AGENTFIXTURE_VERSION = "v1.3.0"; irm https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.ps1 | iex
 
 function Install-AgentFixture {
     $ErrorActionPreference = 'Stop'

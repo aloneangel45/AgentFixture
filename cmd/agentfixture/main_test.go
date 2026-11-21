@@ -24,13 +24,13 @@ import (
 )
 
 func TestCLI_VersionFormattingNoDoubleV(t *testing.T) {
-	if got := formatVersionString("v1.2.2"); !strings.Contains(got, "AgentFixture v1.2.2") || strings.Contains(got, "vv1.2.2") {
-		t.Fatalf("unexpected version formatting for v1.2.2: %q", got)
+	if got := formatVersionString("v1.3.0"); !strings.Contains(got, "AgentFixture v1.3.0") || strings.Contains(got, "vv1.3.0") {
+		t.Fatalf("unexpected version formatting for v1.3.0: %q", got)
 	}
-	if got := formatVersionString("1.2.2"); !strings.Contains(got, "AgentFixture v1.2.2") {
-		t.Fatalf("unexpected version formatting for 1.2.2: %q", got)
+	if got := formatVersionString("1.3.0"); !strings.Contains(got, "AgentFixture v1.3.0") {
+		t.Fatalf("unexpected version formatting for 1.3.0: %q", got)
 	}
-	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.2.2") {
+	if got := formatVersionString(""); !strings.Contains(got, "AgentFixture v1.3.0") {
 		t.Fatalf("unexpected empty fallback version formatting: %q", got)
 	}
 }
@@ -678,7 +678,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	// Build a tiny real zip containing a compiled Windows helper binary that prints version
 	tmpDir := t.TempDir()
 	binSrc := filepath.Join(tmpDir, "stub.go")
-	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.2.2 (installer-test)\") }\n"), 0644); err != nil {
+	if err := os.WriteFile(binSrc, []byte("package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"AgentFixture v1.3.0 (installer-test)\") }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	builtExe := filepath.Join(tmpDir, "agentfixture.exe")
@@ -743,7 +743,7 @@ func TestInstallers_IntegrityAndPowerShellSHA256Verification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install.ps1 failed on valid SHA-256 archive: %v\nOutput:\n%s", err, string(outOK))
 	}
-	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.2.2") {
+	if !strings.Contains(string(outOK), "SHA-256 verified") || !strings.Contains(string(outOK), "AgentFixture v1.3.0") {
 		t.Errorf("unexpected install.ps1 output:\n%s", string(outOK))
 	}
 	destExeOK := filepath.Join(installDirOK, "agentfixture.exe")
@@ -886,5 +886,267 @@ func TestCLI_TrailingFlagsAfterPositionalArgsAndStructuredDiffAndRedact(t *testi
 	diffErr2 := handleDiff([]string{redactedPath, driftedErrPath, "-exit-code"})
 	if !errors.Is(diffErr2, errDiffDetected) {
 		t.Fatalf("expected handleDiff to detect Response.Error drift, got: %v", diffErr2)
+	}
+}
+
+func TestCLI_V130_VerifyBudgetAndGitHubSummary(t *testing.T) {
+	tmpDir := t.TempDir()
+	casPath := filepath.Join(tmpDir, "budget.yaml")
+	summaryPath := filepath.Join(tmpDir, "gh_summary.md")
+	pricingPath := filepath.Join(tmpDir, "pricing.json")
+
+	cas := cassette.NewCassette("cas_budget_cli")
+	cas.Metadata.Model = "claude-sonnet-4-5"
+	cas.Interactions = append(cas.Interactions, cassette.Interaction{
+		ID:       "int_001",
+		Sequence: 1,
+		Type:     cassette.InteractionTypeHTTP,
+		Request:  cassette.Request{Method: "POST", Endpoint: "/v1/messages", RawBody: `{"prompt":"hi"}`},
+		Response: cassette.Response{
+			StatusCode: 200,
+			Usage: cassette.Usage{
+				InputTokens:          2000,
+				OutputTokens:         500,
+				CacheReadInputTokens: 2000,
+			},
+		},
+	})
+	if err := cassette.Save(casPath, cas); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pricingPath, []byte(`{"claude-sonnet-4-5":{"input_per_million":3,"output_per_million":15,"cache_read_per_million":0.3,"cache_write_per_million":3.75}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Passing thresholds + GitHub summary path
+	if err := handleVerify([]string{
+		"-max-tokens", "10000",
+		"-max-cost-usd", "0.10",
+		"-min-cache-hit-rate", "0.40",
+		"-pricing-file", pricingPath,
+		"-github-summary-path", summaryPath,
+		casPath,
+	}); err != nil {
+		t.Fatalf("expected handleVerify budget check to pass, got: %v", err)
+	}
+	sumBytes, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("expected GitHub summary file written: %v", err)
+	}
+	if !strings.Contains(string(sumBytes), "PASS") || !strings.Contains(string(sumBytes), "50.0%") {
+		t.Fatalf("unexpected summary markdown:\n%s", string(sumBytes))
+	}
+
+	// Failing max-tokens threshold
+	if err := handleVerify([]string{"-max-tokens", "100", casPath}); err == nil {
+		t.Fatalf("expected handleVerify to fail when max-tokens is exceeded")
+	}
+	// Failing min-cache-hit-rate threshold
+	if err := handleVerify([]string{"-min-cache-hit-rate", "0.90", casPath}); err == nil {
+		t.Fatalf("expected handleVerify to fail when min-cache-hit-rate is not met")
+	}
+}
+
+func TestCLI_V130_ReplayChaosAndHybridNewEpisodes(t *testing.T) {
+	if helper := os.Getenv("AGENTFIXTURE_V130_HELPER"); helper != "" {
+		baseURL := os.Getenv("ANTHROPIC_BASE_URL")
+		switch helper {
+		case "chaos_retry":
+			got429 := false
+			for i := 0; i < 3; i++ {
+				resp, err := http.Post(baseURL+"/v1/messages", "application/json", strings.NewReader(`{"prompt":"ep1"}`))
+				if err != nil {
+					os.Exit(2)
+				}
+				_, _ = io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusTooManyRequests {
+					got429 = true
+					continue
+				}
+				if resp.StatusCode == http.StatusOK && got429 {
+					os.Exit(0)
+				}
+				os.Exit(3)
+			}
+			os.Exit(4)
+		case "hybrid_two_episodes":
+			for _, body := range []string{`{"prompt":"ep1"}`, `{"prompt":"ep2"}`} {
+				resp, err := http.Post(baseURL+"/v1/messages", "application/json", strings.NewReader(body))
+				if err != nil {
+					os.Exit(2)
+				}
+				_, _ = io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					os.Exit(3)
+				}
+			}
+			os.Exit(0)
+		}
+	}
+
+	tmpDir := t.TempDir()
+	casPath := filepath.Join(tmpDir, "hybrid.yaml")
+
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":50}}`))
+	}))
+	defer upstream.Close()
+
+	// Seed ep1 into cassette
+	cas := cassette.NewCassette("cas_v130_cli")
+	cas.Metadata.Model = "claude-sonnet-4-5"
+	cas.Interactions = append(cas.Interactions, cassette.Interaction{
+		ID:       "int_001",
+		Sequence: 1,
+		Type:     cassette.InteractionTypeHTTP,
+		Request:  cassette.Request{Method: "POST", Endpoint: "/v1/messages", RawBody: `{"prompt":"ep1"}`},
+		Response: cassette.Response{
+			StatusCode: 200,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			RawBody:    `{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":20}}`,
+		},
+	})
+	if err := cassette.Save(casPath, cas); err != nil {
+		t.Fatal(err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Replay with -chaos-rate-limit 1 (must hit 429 first, then succeed on retry!)
+	t.Setenv("AGENTFIXTURE_V130_HELPER", "chaos_retry")
+	if err := handleReplay([]string{
+		"-cassette", casPath,
+		"-chaos-rate-limit", "1",
+		"-chaos-seed", "42",
+		"-max-tokens", "5000",
+		"--",
+		exe, "-test.run=^TestCLI_V130_ReplayChaosAndHybridNewEpisodes$",
+	}); err != nil {
+		t.Fatalf("handleReplay with chaos failed: %v", err)
+	}
+
+	// 2. Validation: -record-mode new_episodes without -upstream fails
+	if err := handleReplay([]string{"-cassette", casPath, "-record-mode", "new_episodes"}); err == nil {
+		t.Fatalf("expected error when -record-mode=new_episodes lacks -upstream")
+	}
+
+	// 3. Hybrid new_episodes: ep1 replayed offline (0 hits), ep2 recorded from upstream (1 hit) and saved!
+	t.Setenv("AGENTFIXTURE_V130_HELPER", "hybrid_two_episodes")
+	if err := handleReplay([]string{
+		"-cassette", casPath,
+		"-record-mode", "new_episodes",
+		"-upstream", upstream.URL,
+		"--",
+		exe, "-test.run=^TestCLI_V130_ReplayChaosAndHybridNewEpisodes$",
+	}); err != nil {
+		t.Fatalf("handleReplay -record-mode=new_episodes failed: %v", err)
+	}
+	if upstreamHits != 1 {
+		t.Fatalf("expected exactly 1 upstream hit (ep2 only), got %d", upstreamHits)
+	}
+
+	updated, err := cassette.Load(casPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Interactions) != 2 {
+		t.Fatalf("expected 2 saved interactions after new_episodes, got %d", len(updated.Interactions))
+	}
+}
+
+func TestCLI_V130_TestCommandYAMLAndDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	cas1 := filepath.Join(tmpDir, "c1.yaml")
+	cas2 := filepath.Join(tmpDir, "c2.yaml")
+
+	mkCas := func(id string, tokens int) *cassette.Cassette {
+		c := cassette.NewCassette(id)
+		c.Metadata.Model = "gpt-4o"
+		c.Interactions = append(c.Interactions, cassette.Interaction{
+			ID:       "int_001",
+			Sequence: 1,
+			Type:     cassette.InteractionTypeHTTP,
+			Request:  cassette.Request{Method: "POST", Endpoint: "/v1/chat/completions"},
+			Response: cassette.Response{
+				StatusCode: 200,
+				Usage:      cassette.Usage{InputTokens: tokens, OutputTokens: 100, CacheReadInputTokens: tokens},
+			},
+		})
+		return c
+	}
+	if err := cassette.Save(cas1, mkCas("cas_1", 500)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cassette.Save(cas2, mkCas("cas_2", 700)); err != nil {
+		t.Fatal(err)
+	}
+
+	suitePath := filepath.Join(tmpDir, "suite.yaml")
+	suiteBody := `version: agentfixture/suite/v1
+name: cli-test-suite
+cases:
+  - name: case_one
+    cassette: c1.yaml
+    mode: verify
+  - name: case_two
+    cassette: c2.yaml
+    mode: verify
+`
+	if err := os.WriteFile(suitePath, []byte(suiteBody), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	junitPath := filepath.Join(tmpDir, "suite-junit.xml")
+	summaryPath := filepath.Join(tmpDir, "suite-summary.md")
+
+	out, err := captureStdout(t, func() error {
+		return handleTest([]string{
+			"-concurrency", "2",
+			"-json",
+			"-junit", junitPath,
+			"-github-summary-path", summaryPath,
+			"-max-tokens", "10000",
+			suitePath,
+		})
+	})
+	if err != nil {
+		t.Fatalf("handleTest suite.yaml failed: %v", err)
+	}
+	if !strings.Contains(out, `"passed": true`) || !strings.Contains(out, `"total_cases": 2`) {
+		t.Fatalf("unexpected handleTest JSON output:\n%s", out)
+	}
+
+	var parsed junit.TestSuites
+	xmlData, err := os.ReadFile(junitPath)
+	if err != nil {
+		t.Fatalf("expected JUnit XML file written: %v", err)
+	}
+	if err := xml.Unmarshal(xmlData, &parsed); err != nil {
+		t.Fatalf("invalid suite JUnit XML: %v", err)
+	}
+	if parsed.Tests != 2 || parsed.Failures != 0 {
+		t.Fatalf("unexpected suite JUnit counts: tests=%d failures=%d", parsed.Tests, parsed.Failures)
+	}
+
+	mdData, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("expected GitHub summary written: %v", err)
+	}
+	if !strings.Contains(string(mdData), "cli-test-suite") {
+		t.Fatalf("unexpected suite summary markdown:\n%s", string(mdData))
+	}
+
+	// Directory mode directly on tmpDir (skips suite.yaml automatically!)
+	if err := handleTest([]string{"-concurrency", "2", tmpDir}); err != nil {
+		t.Fatalf("handleTest directory mode failed: %v", err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 	"github.com/aloneangel45/AgentFixture/pkg/proxy"
 )
@@ -29,6 +30,7 @@ type TestReport struct {
 	CassetteID        string             `json:"cassette_id"`
 	TotalExpected     int                `json:"total_expected"`
 	MatchedCount      int                `json:"matched_count"`
+	MatchedIDs        map[string]bool    `json:"matched_ids,omitempty"`
 	UnmatchedExpected []string           `json:"unmatched_expected,omitempty"`
 	UnexpectedCalls   []cassette.Request `json:"unexpected_calls,omitempty"`
 	DriftDetails      []DriftInfo        `json:"drift_details,omitempty"`
@@ -36,6 +38,8 @@ type TestReport struct {
 	CommandOutput     string             `json:"command_output,omitempty"`
 	TokensSaved       int64              `json:"tokens_saved"`
 	CostSavedUSD      float64            `json:"cost_saved_usd"`
+	NewEpisodes       int                `json:"new_episodes,omitempty"`
+	ChaosStats        chaos.Stats        `json:"chaos_stats,omitempty"`
 	Duration          time.Duration      `json:"duration"`
 	Passed            bool               `json:"passed"`
 }
@@ -93,9 +97,11 @@ type RunOptions struct {
 	StrictMode  bool
 	Timeout     time.Duration
 	Mode        proxy.Mode
+	RecordMode  proxy.RecordMode
 	UpstreamURL string
 	Server      *proxy.Server
 	SSETiming   cassette.SSETimingConfig
+	Chaos       *chaos.Injector
 }
 
 // Run executes the target command against a deterministic replay or live recording proxy
@@ -130,11 +136,13 @@ func Run(opts RunOptions) (*TestReport, error) {
 		var err error
 		srv, err = proxy.NewServer(proxy.Config{
 			Mode:          mode,
+			RecordMode:    opts.RecordMode,
 			UpstreamURL:   opts.UpstreamURL,
 			Cassette:      opts.Cassette,
 			Matcher:       opts.Matcher,
 			SimulateDelay: false,
 			SSETiming:     opts.SSETiming,
+			Chaos:         opts.Chaos,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create %s server: %w", mode, err)
@@ -152,6 +160,8 @@ func Run(opts RunOptions) (*TestReport, error) {
 	if ownsServer {
 		defer srv.Close()
 	}
+
+	effectiveRecordMode := srv.RecordMode()
 
 	// 2. Prepare deduplicated environment variables (case-insensitive on Windows!)
 	proxyURL := srv.URL()
@@ -173,8 +183,8 @@ func Run(opts RunOptions) (*TestReport, error) {
 	}
 
 	var fallbacks map[string]string
-	if mode == proxy.ModeReplay {
-		// Provide dummy SDK keys in replay mode when unset so agent SDKs initialize cleanly in zero-secret CI.
+	if effectiveRecordMode == proxy.RecordModeNone {
+		// Provide dummy SDK keys in strict offline replay mode when unset so agent SDKs initialize cleanly in zero-secret CI.
 		fallbacks = map[string]string{
 			"ANTHROPIC_API_KEY": "af-replay-offline-key",
 			"OPENAI_API_KEY":    "af-replay-offline-key",
@@ -218,7 +228,7 @@ func Run(opts RunOptions) (*TestReport, error) {
 	activeCas := srv.GetCassette()
 	activeCas.ComputeMetrics()
 
-	if mode == proxy.ModeRecord {
+	if effectiveRecordMode == proxy.RecordModeAll {
 		if opts.Cassette != nil {
 			*opts.Cassette = *activeCas
 		}
@@ -226,13 +236,20 @@ func Run(opts RunOptions) (*TestReport, error) {
 			CassetteID:      activeCas.Metadata.CassetteID,
 			TotalExpected:   len(activeCas.Interactions),
 			MatchedCount:    len(activeCas.Interactions),
+			MatchedIDs:      srv.MatchedIDs(),
 			CommandExitCode: exitCode,
 			CommandOutput:   outputBuf.String(),
 			TokensSaved:     activeCas.Metadata.Metrics.EstimatedTokensSaved,
 			CostSavedUSD:    activeCas.Metadata.Metrics.EstimatedCostSavedUSD,
+			NewEpisodes:     srv.NewEpisodesCount(),
+			ChaosStats:      srv.ChaosStats(),
 			Duration:        duration,
 			Passed:          exitCode == 0,
 		}, nil
+	}
+
+	if effectiveRecordMode == proxy.RecordModeNewEpisodes && opts.Cassette != nil {
+		*opts.Cassette = *activeCas
 	}
 
 	matchedIDs := srv.MatchedIDs()
@@ -258,12 +275,15 @@ func Run(opts RunOptions) (*TestReport, error) {
 		CassetteID:        activeCas.Metadata.CassetteID,
 		TotalExpected:     len(activeCas.Interactions),
 		MatchedCount:      srv.MatchedCount(),
+		MatchedIDs:        matchedIDs,
 		UnmatchedExpected: unmatchedExpected,
 		DriftDetails:      driftDetails,
 		CommandExitCode:   exitCode,
 		CommandOutput:     outputBuf.String(),
 		TokensSaved:       activeCas.Metadata.Metrics.EstimatedTokensSaved,
 		CostSavedUSD:      activeCas.Metadata.Metrics.EstimatedCostSavedUSD,
+		NewEpisodes:       srv.NewEpisodesCount(),
+		ChaosStats:        srv.ChaosStats(),
 		Duration:          duration,
 		Passed:            exitCode == 0,
 	}

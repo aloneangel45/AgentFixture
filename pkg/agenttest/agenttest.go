@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 	"github.com/aloneangel45/AgentFixture/pkg/proxy"
 )
@@ -47,6 +48,16 @@ func WithAllowUnmatched(allow bool) Option {
 // WithRecordMode switches the TestServer into live recording mode against upstreamURL and writes cassettePath on cleanup.
 func WithRecordMode(upstreamURL string) Option {
 	return proxy.WithTestRecordMode(upstreamURL)
+}
+
+// WithHybridRecordMode configures hybrid recording (none, new_episodes, all) against upstreamURL.
+func WithHybridRecordMode(mode proxy.RecordMode, upstreamURL string) Option {
+	return proxy.WithTestHybridRecordMode(mode, upstreamURL)
+}
+
+// WithChaos attaches a deterministic chaos.Injector to the TestServer.
+func WithChaos(inj *chaos.Injector) Option {
+	return proxy.WithTestChaos(inj)
 }
 
 // NewTestServer loads cassettePath, starts a local replay proxy on 127.0.0.1:0,

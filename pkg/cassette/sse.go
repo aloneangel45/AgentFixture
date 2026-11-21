@@ -938,6 +938,20 @@ func mergeOpenAIOrAnthropicUsage(dst *Usage, uMap map[string]interface{}) {
 	if v, ok := uMap["completion_tokens"]; ok {
 		dst.OutputTokens = asInt(v)
 	}
+	if details, ok := uMap["prompt_tokens_details"].(map[string]interface{}); ok {
+		if v, ok := details["cached_tokens"]; ok {
+			if n := asInt(v); n > 0 || dst.CacheReadInputTokens == 0 {
+				dst.CacheReadInputTokens = n
+			}
+		}
+	}
+	if details, ok := uMap["input_tokens_details"].(map[string]interface{}); ok {
+		if v, ok := details["cached_tokens"]; ok {
+			if n := asInt(v); n > 0 || dst.CacheReadInputTokens == 0 {
+				dst.CacheReadInputTokens = n
+			}
+		}
+	}
 }
 
 // ExtractUsageFromBody extracts Anthropic, OpenAI, or Google Gemini Usage statistics
@@ -993,10 +1007,18 @@ func ExtractResponseUsage(resp *Response) Usage {
 			return u
 		}
 	}
-	if raw := strings.TrimSpace(resp.RawBody); len(raw) > 0 && raw[0] == '{' {
-		if parsed, err := decodeJSONMapUseNumber([]byte(raw)); err == nil {
-			if u := ExtractUsageFromBody(parsed); !u.IsZero() {
-				return u
+	if raw := strings.TrimSpace(resp.RawBody); len(raw) > 0 {
+		if raw[0] == '{' {
+			if parsed, err := decodeJSONMapUseNumber([]byte(raw)); err == nil {
+				if u := ExtractUsageFromBody(parsed); !u.IsZero() {
+					return u
+				}
+			}
+		} else if strings.Contains(raw, "data:") {
+			if evs, err := DecodeSSE(strings.NewReader(raw)); err == nil && len(evs) > 0 {
+				if u := ReconstructStreamSummary(evs).Usage; !u.IsZero() {
+					return u
+				}
 			}
 		}
 	}

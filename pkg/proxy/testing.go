@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"net/http"
+	"os"
 	"testing"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 )
 
@@ -17,7 +19,9 @@ type testServerConfig struct {
 	strictAllMatched bool
 	allowUnmatched   bool
 	mode             Mode
+	recordMode       RecordMode
 	upstreamURL      string
+	chaos            *chaos.Injector
 }
 
 // WithTestMatcher overrides the request Matcher (default: StrictMatcher).
@@ -53,7 +57,28 @@ func WithTestAllowUnmatched(allow bool) TestOption {
 func WithTestRecordMode(upstreamURL string) TestOption {
 	return func(c *testServerConfig) {
 		c.mode = ModeRecord
+		c.recordMode = RecordModeAll
 		c.upstreamURL = upstreamURL
+	}
+}
+
+// WithTestHybridRecordMode configures hybrid recording (none, new_episodes, all) against upstreamURL.
+func WithTestHybridRecordMode(mode RecordMode, upstreamURL string) TestOption {
+	return func(c *testServerConfig) {
+		c.recordMode = mode
+		c.upstreamURL = upstreamURL
+		if mode == RecordModeAll {
+			c.mode = ModeRecord
+		} else {
+			c.mode = ModeReplay
+		}
+	}
+}
+
+// WithTestChaos attaches a deterministic chaos.Injector to the TestServer.
+func WithTestChaos(inj *chaos.Injector) TestOption {
+	return func(c *testServerConfig) {
+		c.chaos = inj
 	}
 }
 
@@ -85,9 +110,19 @@ func NewTestServer(tb testing.TB, cassettePath string, opts ...TestOption) *Test
 
 	var cas *cassette.Cassette
 	var err error
-	if cfg.mode == ModeRecord {
+	if cfg.mode == ModeRecord || cfg.recordMode == RecordModeAll {
 		cas = cassette.NewCassette(tb.Name())
 		cas.Metadata.Source = "agentfixture_go_sdk"
+	} else if cfg.recordMode == RecordModeNewEpisodes {
+		cas, err = cassette.Load(cassettePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				cas = cassette.NewCassette(tb.Name())
+				cas.Metadata.Source = "agentfixture_go_sdk"
+			} else {
+				tb.Fatalf("agentfixture: failed to load cassette %q: %v", cassettePath, err)
+			}
+		}
 	} else {
 		cas, err = cassette.Load(cassettePath)
 		if err != nil {
@@ -97,10 +132,12 @@ func NewTestServer(tb testing.TB, cassettePath string, opts ...TestOption) *Test
 
 	srv, err := NewServer(Config{
 		Mode:        cfg.mode,
+		RecordMode:  cfg.recordMode,
 		UpstreamURL: cfg.upstreamURL,
 		Cassette:    cas,
 		Matcher:     cfg.matcher,
 		SSETiming:   cfg.sseTiming,
+		Chaos:       cfg.chaos,
 	})
 	if err != nil {
 		tb.Fatalf("agentfixture: failed to initialize test server: %v", err)
@@ -119,11 +156,16 @@ func NewTestServer(tb testing.TB, cassettePath string, opts ...TestOption) *Test
 
 	tb.Cleanup(func() {
 		_ = srv.Close()
-		if cfg.mode == ModeRecord && cassettePath != "" {
+		if (cfg.mode == ModeRecord || cfg.recordMode == RecordModeAll) && cassettePath != "" {
 			if saveErr := cassette.Save(cassettePath, srv.GetCassette()); saveErr != nil {
 				tb.Errorf("agentfixture: failed to save recorded cassette to %q: %v", cassettePath, saveErr)
 			}
 			return
+		}
+		if cfg.recordMode == RecordModeNewEpisodes && cassettePath != "" && srv.NewEpisodesCount() > 0 {
+			if saveErr := cassette.Save(cassettePath, srv.GetCassette()); saveErr != nil {
+				tb.Errorf("agentfixture: failed to save updated cassette to %q: %v", cassettePath, saveErr)
+			}
 		}
 		if tb.Failed() {
 			return

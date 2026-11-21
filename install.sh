@@ -2,7 +2,7 @@
 # AgentFixture Universal POSIX/Bash One-Line Installer (Linux & macOS amd64/arm64)
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
-#   AGENTFIXTURE_VERSION=v1.2.2 curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
+#   AGENTFIXTURE_VERSION=v1.3.0 curl -fsSL https://raw.githubusercontent.com/aloneangel45/AgentFixture/main/install.sh | sh
 
 set -eu
 

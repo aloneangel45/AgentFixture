@@ -11,7 +11,7 @@ import (
 const CurrentVersion = "agentfixture/v1"
 
 // GeneratorVersion is the current semantic release version of AgentFixture.
-const GeneratorVersion = "1.2.2"
+const GeneratorVersion = "1.3.0"
 
 // InteractionType identifies the category of recorded interaction.
 type InteractionType string

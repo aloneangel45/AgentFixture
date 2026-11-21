@@ -5,6 +5,17 @@ All notable changes to **AgentFixture** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-21
+
+### Added
+- **Deterministic Chaos / Fault Injection Engine (`pkg/chaos`, `pkg/proxy`, `cmd/agentfixture`)**: Added thread-safe, seeded PRNG fault injection (`-chaos-seed`, `-chaos-rate-limit`, `-chaos-overload`, `-chaos-drop-sse-after`, `-chaos-latency-ms`, `-chaos-jitter-ms`, `-chaos-error-rate`) wired into both HTTP/SSE replay (HTTP `429` with `Retry-After: 1`, Anthropic-style HTTP `529` overloaded JSON, HTTP `500`, deterministic TCP-hijacked SSE mid-stream drops) and MCP stdio replay (JSON-RPC `-32000` errors and deterministic latency) without consuming matched cassette turns on injected faults.
+- **Hybrid Record Mode (`-record-mode none|new_episodes|all`) (`pkg/proxy/http_proxy.go`, `pkg/runner/runner.go`, `pkg/agenttest`, `cmd/agentfixture`)**: Added incremental `new_episodes` recording mode that replays matched requests strictly offline while forwarding only unmatched interactions to `-upstream`, appending collision-free entries and atomically saving updated cassettes on shutdown, while preserving strict zero-outbound-network isolation in default `none` mode.
+- **Token, USD Cost & Prompt Cache Hit-Rate Budget Engine (`pkg/budget`, `pkg/cassette/sse.go`, `cmd/agentfixture`)**: Added built-in 2026 model pricing table (`claude-sonnet-4-5`, `claude-opus-4`, `claude-3-7-sonnet`, `claude-3-5-sonnet`, `gpt-5`, `gpt-4.1`, `gpt-4o`, `o3`, `gemini-2.5-pro`, `gemini-2.5-flash`) with `-pricing-file <json>` override support, OpenAI `prompt_tokens_details.cached_tokens` extraction, raw JSON/SSE usage fallback, CI budget gates (`-max-tokens`, `-max-cost-usd`, `-min-cache-hit-rate`), and GitHub Actions Step Summary Markdown tables (`-github-summary`, `-github-summary-path`) across `verify`, `replay`, and `test`.
+- **Declarative Parallel Test Suite Runner (`pkg/suite`, `pkg/junit`, `cmd/agentfixture`)**: Added `agentfixture test [options] <suite.yaml | fixtures-dir>` supporting `version: agentfixture/suite/v1` YAML manifests (with `http`/`mcp`/`verify` modes, `chaos`, `budget`, `expected_tools`, `forbidden_tools`, `max_turns`, `expect_exit_code`) as well as direct fixture directory execution with bounded `-concurrency` (default `4`), deterministic result ordering, `-json`, `-junit`, and `-github-summary`.
+
+### Fixed
+- **Race-Detector & CI Jitter Performance Guard (`pkg/matcher/matcher_test.go`)**: Scoped the 100KB fuzzy matcher quadratic-regression guard via build tags (`race_enabled_test.go` / `race_disabled_test.go`) so `go test -race -count=1 ./...` and parallel CI runs remain rock-solid while catching any `O(N*M)` regression.
+
 ## [1.2.2] - 2026-11-15
 
 ### Fixed

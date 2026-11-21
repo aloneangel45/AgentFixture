@@ -45,7 +45,8 @@
 2. **Full Anthropic, OpenAI & Google Gemini SSE Streaming Fidelity**: Records and replays raw Server-Sent Event streams (`message_start`, `thinking_delta`, `signature_delta`, `text_delta`, `input_json_delta`, `citations_delta`, OpenAI `data: [DONE]`, and Gemini `candidates` / `thought: true` / `functionCall` / `thoughtSignature` / `usageMetadata`) with `instant` (`0ms`), `scaled`, or `exact` chunk timing.
 3. **Strict Zero-Outbound-Network Enforcement**: Rejects `HTTP CONNECT` tunnels (`403 Forbidden`), locks `proxy.NewOfflineHTTPClient` strictly to loopback (`127.0.0.1`, `::1`, `localhost`), and injects offline SDK keys so tests cannot leak external traffic.
 4. **Stateful Multi-Turn & MCP Framing**: Replays identical sequential requests in turn order before idempotent fallback, and supports both NDJSON and `Content-Length` MCP stdio framing up to 16 MB.
-5. **Pre-Hash Secret Redaction & Native CI JUnit XML**: Scrubs Anthropic, OpenAI, Google (`AIza*`, `x-goog-api-key`), GitHub, AWS, Slack, HuggingFace, Bearer, Cookie, URL basic-auth, and PEM credentials *before* computing SHA-256 `StrictHash` digests, and emits standard JUnit XML (`-junit`) for native GitHub Actions, GitLab CI, and CircleCI annotations.
+5. **Pre-Hash Secret Redaction, CI Budgets & Native JUnit / GitHub Step Summary**: Scrubs Anthropic, OpenAI, Google (`AIza*`, `x-goog-api-key`), GitHub, AWS, Slack, HuggingFace, Bearer, Cookie, URL basic-auth, and PEM credentials *before* computing SHA-256 `StrictHash` digests; enforces token, USD cost, and prompt cache hit-rate gates (`-max-tokens`, `-max-cost-usd`, `-min-cache-hit-rate`); and emits JUnit XML (`-junit`) and GitHub Actions Step Summary Markdown (`-github-summary`).
+6. **Deterministic Chaos Engineering, Hybrid Recording & Parallel Test Suites**: Inject reproducible HTTP `429`/`529`/`500`, MCP JSON-RPC `-32000`, latency/jitter, and SSE stream drops (`--chaos-*`); update cassettes incrementally with `-record-mode new_episodes`; and run declarative YAML suites or fixture directories in parallel with `agentfixture test`.
 
 ---
 
@@ -53,23 +54,24 @@
 
 ```text
 +-------------------------------------------------------------------------------+
-|                           AgentFixture v1.2 Engine                            |
+|                           AgentFixture v1.3 Engine                            |
 +-------------------------------------------------------------------------------+
 |                                                                               |
 |  +-------------------------------------------------------------------------+  |
 |  |                       CLI & Go Testing SDK (agenttest)                  |  |
-|  |   (record | replay | verify | inspect | redact | import | diff)         |  |
+|  |   (record | replay | test | verify | inspect | redact | import | diff)  |  |
 |  +------------------------------------+------------------------------------+  |
 |                                       |                                       |
 |                  +--------------------+--------------------+                  |
 |                  |                                         |                  |
 |                  v                                         v                  |
 |  +-------------------------------+         +-------------------------------+  |
-|  |    Recording Tap Engine       |         |  Offline Replay & Guard Eng.  |  |
+|  |    Recording Tap Engine       |         |  Offline Replay & Chaos Eng.  |  |
 |  |  - HTTP & Live SSE Streamer   |         |  - Loopback-Only Dial Guard   |  |
-|  |  - Gzip Auto-Decompression    |         |  - Stateful Multi-Turn Queue  |  |
+|  |  - Hybrid new_episodes Mode   |         |  - Deterministic Chaos (429/  |  |
+|  |  - Gzip Auto-Decompression    |         |    529/SSE-Drop/Latency)      |  |
 |  |  - MCP Stdio Tap (16MB)       |         |  - Instant/Scaled/Exact SSE   |  |
-|  |  - Pre-Hash Secret Redactor   |         |  - Strict 64-bit & Fuzzy O(N) |  |
+|  |  - Pre-Hash Secret Redactor   |         |  - Budget & Cache-Hit Engine  |  |
 |  +---------------+---------------+         +---------------+---------------+  |
 |                  |                                         ^                  |
 |                  |          +-------------------+          |                  |
@@ -223,6 +225,88 @@ agentfixture diff -exit-code fixtures/v1.yaml fixtures/v2.yaml
 agentfixture import -traceport ~/.traceport/sessions/trace_1793907746.json -out fixtures/auth_flow.yaml
 ```
 
+### 7. Deterministic Chaos / Fault Injection (`pkg/chaos`)
+
+Exercise retry loops, exponential backoff, overload handling, and mid-stream SSE recovery deterministically offline:
+
+```bash
+# Inject HTTP 429 (Retry-After: 1) on the first 2 requests so retry logic is tested deterministically
+agentfixture replay -cassette fixtures/claude_stream.yaml -chaos-rate-limit 2 -chaos-seed 42 -- python agent.py
+
+# Inject Anthropic-style HTTP 529 Overloaded on the first request + 50ms latency
+agentfixture replay -cassette fixtures/claude_stream.yaml -chaos-overload 1 -chaos-latency-ms 50 -- python agent.py
+
+# Deterministically truncate SSE streams after 3 events and close the connection to test stream recovery
+agentfixture replay -cassette fixtures/claude_stream.yaml -chaos-drop-sse-after 3 -- python agent.py
+
+# Seeded fault probability across HTTP or MCP stdio (-32000 JSON-RPC errors)
+agentfixture replay -mcp -cassette fixtures/mcp_tools.yaml -chaos-error-rate 0.25 -chaos-seed 1337
+```
+
+### 8. Hybrid Record Mode (`-record-mode none|new_episodes|all`)
+
+Replay existing recorded turns offline while automatically forwarding and appending **only** new unmatched requests to `-upstream`:
+
+```bash
+# Strict offline replay (default — zero outbound network calls)
+agentfixture replay -cassette fixtures/agent.yaml -record-mode none -- python agent.py
+
+# Hybrid mode: replay matched turns offline, record unmatched turns from upstream, save atomically on exit
+agentfixture replay -cassette fixtures/agent.yaml -record-mode new_episodes -upstream https://api.anthropic.com -- python agent.py
+```
+
+### 9. Token, USD Cost & Prompt Cache Hit-Rate Budgets + GitHub Step Summary
+
+Enforce CI spend and prompt-caching regressions across Anthropic, OpenAI, and Google Gemini models using the built-in 2026 pricing table (`claude-sonnet-4-5`, `claude-opus-4`, `claude-3-7-sonnet`, `claude-3-5-sonnet`, `gpt-5`, `gpt-4.1`, `gpt-4o`, `o3`, `gemini-2.5-pro`, `gemini-2.5-flash`) or custom `-pricing-file <json>` overrides:
+
+```bash
+agentfixture verify \
+  -max-tokens 50000 \
+  -max-cost-usd 0.25 \
+  -min-cache-hit-rate 0.30 \
+  -pricing-file pricing_overrides.json \
+  -github-summary \
+  fixtures/
+```
+
+### 10. Declarative Parallel Test Suite Runner (`agentfixture test`)
+
+Run an entire YAML regression suite (HTTP/SSE, MCP stdio, chaos, budgets, and tool/turn assertions) or a fixture directory in parallel:
+
+```yaml
+# agentfixture-suite.yaml
+version: agentfixture/suite/v1
+name: coding-agent-ci
+defaults:
+  matcher: strict
+  timing: instant
+  budget:
+    max_tokens: 40000
+    max_cost_usd: 0.25
+cases:
+  - name: claude_refactor_with_429_retry
+    cassette: fixtures/claude_refactor.yaml
+    mode: http
+    command: python
+    args: ["run_agent.py"]
+    chaos:
+      seed: 42
+      rate_limit: 1
+    assertions:
+      expected_tools: ["read_file", "edit_file"]
+      forbidden_tools: ["delete_database"]
+      max_turns: 8
+      expect_exit_code: 0
+```
+
+```bash
+# Execute YAML suite in parallel with JUnit XML and GitHub Step Summary output
+agentfixture test -concurrency 4 -junit reports/suite.xml -github-summary agentfixture-suite.yaml
+
+# Or run schema + budget checks directly across a fixtures directory
+agentfixture test -concurrency 4 -max-cost-usd 0.50 fixtures/
+```
+
 ---
 
 ## Go Testing SDK (`pkg/agenttest`)
@@ -281,7 +365,7 @@ version: "agentfixture/v1"
 metadata:
   cassette_id: "cas_anthropic_sse_01"
   recorded_at: "2026-11-10T16:40:00Z"
-  generator: "AgentFixture v1.2.2"
+  generator: "AgentFixture v1.3.0"
   model: "claude-sonnet-4-20250514"
   metrics:
     total_interactions: 1

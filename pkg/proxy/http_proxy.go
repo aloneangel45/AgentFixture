@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 )
 
@@ -34,6 +35,33 @@ const (
 	ModePassthrough Mode = "passthrough"
 )
 
+// RecordMode controls hybrid offline replay vs upstream recording behavior.
+type RecordMode string
+
+const (
+	// RecordModeNone enforces strict offline replay with zero outbound network calls.
+	RecordModeNone RecordMode = "none"
+	// RecordModeNewEpisodes replays matched interactions offline and forwards only unmatched
+	// requests to UpstreamURL, appending newly recorded episodes to the cassette.
+	RecordModeNewEpisodes RecordMode = "new_episodes"
+	// RecordModeAll records all interactions against UpstreamURL.
+	RecordModeAll RecordMode = "all"
+)
+
+// ParseRecordMode parses a CLI or configuration string into a validated RecordMode.
+func ParseRecordMode(raw string) (RecordMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "none":
+		return RecordModeNone, nil
+	case "new_episodes":
+		return RecordModeNewEpisodes, nil
+	case "all":
+		return RecordModeAll, nil
+	default:
+		return "", fmt.Errorf("unsupported record mode %q (expected none, new_episodes, or all)", raw)
+	}
+}
+
 // DriftRecord captures a non-exact (<1.0) semantic match observed during replay.
 type DriftRecord struct {
 	InteractionID string
@@ -45,6 +73,7 @@ type DriftRecord struct {
 // Config configures the HTTP proxy/replay server.
 type Config struct {
 	Mode           Mode
+	RecordMode     RecordMode
 	UpstreamURL    string
 	Cassette       *cassette.Cassette
 	Matcher        matcher.Matcher
@@ -52,6 +81,7 @@ type Config struct {
 	ListenAddr     string
 	MaxReplayDelay time.Duration
 	SSETiming      cassette.SSETimingConfig
+	Chaos          *chaos.Injector
 }
 
 // Server provides deterministic HTTP/SSE playback and recording interception.
@@ -68,6 +98,7 @@ type Server struct {
 	matchedIDs     map[string]bool
 	unmatched      []cassette.Request
 	driftRecords   []DriftRecord
+	newEpisodes    int
 	upstream       *url.URL
 }
 
@@ -75,6 +106,22 @@ type Server struct {
 func NewServer(cfg Config) (*Server, error) {
 	if cfg.Mode == "" {
 		cfg.Mode = ModeReplay
+	}
+	if cfg.RecordMode == "" {
+		if cfg.Mode == ModeRecord {
+			cfg.RecordMode = RecordModeAll
+		} else {
+			cfg.RecordMode = RecordModeNone
+		}
+	} else {
+		parsedRM, err := ParseRecordMode(string(cfg.RecordMode))
+		if err != nil {
+			return nil, err
+		}
+		cfg.RecordMode = parsedRM
+	}
+	if cfg.RecordMode == RecordModeNewEpisodes && strings.TrimSpace(cfg.UpstreamURL) == "" {
+		return nil, fmt.Errorf("record mode %q requires an upstream URL", RecordModeNewEpisodes)
 	}
 	if cfg.Matcher == nil {
 		cfg.Matcher = matcher.NewStrictMatcher()
@@ -173,6 +220,25 @@ func (s *Server) Close() error {
 // Mode returns the configured proxy Mode.
 func (s *Server) Mode() Mode {
 	return s.cfg.Mode
+}
+
+// RecordMode returns the effective RecordMode (none, new_episodes, or all).
+func (s *Server) RecordMode() RecordMode {
+	return s.cfg.RecordMode
+}
+
+// NewEpisodesCount returns how many unmatched interactions were forwarded and recorded
+// in RecordModeNewEpisodes (or RecordModeAll) during this server's lifetime.
+func (s *Server) NewEpisodesCount() int {
+	s.WaitIdle()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.newEpisodes
+}
+
+// ChaosStats returns a snapshot of deterministic faults injected by this server.
+func (s *Server) ChaosStats() chaos.Stats {
+	return s.cfg.Chaos.Stats()
 }
 
 // Addr returns the network address string (e.g. 127.0.0.1:54321).
@@ -354,9 +420,18 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch s.cfg.Mode {
 	case ModeReplay:
-		s.handleReplay(w, r, &candidate)
+		if s.cfg.RecordMode == RecordModeAll {
+			s.handleRecord(w, r, &candidate, bodyBytes, true)
+		} else {
+			s.handleReplay(w, r, &candidate, bodyBytes)
+		}
 	case ModeRecord:
-		s.handleRecord(w, r, &candidate, bodyBytes)
+		switch s.cfg.RecordMode {
+		case RecordModeNone, RecordModeNewEpisodes:
+			s.handleReplay(w, r, &candidate, bodyBytes)
+		default:
+			s.handleRecord(w, r, &candidate, bodyBytes, true)
+		}
 	case ModePassthrough:
 		s.handlePassthrough(w, r, bodyBytes)
 	default:
@@ -412,7 +487,22 @@ func (s *Server) selectMatchLocked(candidate *cassette.Request) (*cassette.Inter
 	return bestInter, bestScore, lastDiff
 }
 
-func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate *cassette.Request) {
+func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate *cassette.Request, bodyBytes []byte) {
+	var dropSSEAfter int
+	if s.cfg.Chaos != nil && s.cfg.Chaos.Enabled() {
+		dec := s.cfg.Chaos.Evaluate()
+		if dec.Latency > 0 {
+			if err := chaos.SleepContext(r.Context(), dec.Latency); err != nil {
+				return
+			}
+		}
+		if dec.Fault != chaos.FaultNone {
+			chaos.WriteHTTPFault(w, dec.Fault)
+			return
+		}
+		dropSSEAfter = dec.DropSSEAfter
+	}
+
 	redactedCandidate := candidate.Clone()
 	cassette.RedactRequest(&redactedCandidate)
 	redactedCandidate.Matcher.StrictHash = matcher.ComputeRequestHash(&redactedCandidate)
@@ -425,6 +515,11 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate 
 	}
 
 	if bestInter == nil {
+		if s.cfg.RecordMode == RecordModeNewEpisodes {
+			s.mu.Unlock()
+			s.handleRecord(w, r, candidate, bodyBytes, true)
+			return
+		}
 		s.unmatched = append(s.unmatched, redactedCandidate)
 		s.mu.Unlock()
 
@@ -498,13 +593,37 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate 
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		}
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(status)
 
 		events := matchedSnapshot.Response.SSEEvents
 		if len(events) == 0 && matchedSnapshot.Response.RawBody != "" {
 			events, _ = cassette.DecodeSSE(strings.NewReader(matchedSnapshot.Response.RawBody))
 		}
 		flusher, _ := w.(http.Flusher)
+
+		if dropSSEAfter > 0 && len(events) >= dropSSEAfter {
+			w.Header().Set("X-AgentFixture-Chaos", "drop_sse")
+			w.WriteHeader(status)
+			_ = cassette.ReplaySSEStream(r.Context(), w, flusher, events[:dropSSEAfter], s.cfg.SSETiming)
+			s.cfg.Chaos.RecordSSEDrop()
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, hErr := hj.Hijack(); hErr == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+			// Non-hijackable ResponseWriter fallback: emit deterministic SSE error frame and close.
+			errFrame := cassette.SSEEvent{
+				Event: cassette.SSEEventError,
+				Data:  fmt.Sprintf(`{"type":"error","error":{"type":"stream_interrupted","message":"SSE stream truncated after %d events (AgentFixture chaos injection)"}}`, dropSSEAfter),
+			}
+			_, _ = w.Write(cassette.EncodeSSEEvent(errFrame))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+
+		w.WriteHeader(status)
 		_ = cassette.ReplaySSEStream(r.Context(), w, flusher, events, s.cfg.SSETiming)
 		return
 	}
@@ -519,7 +638,7 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request, candidate 
 	}
 }
 
-func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate *cassette.Request, bodyBytes []byte) {
+func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate *cassette.Request, bodyBytes []byte, markMatched bool) {
 	if s.upstream == nil {
 		http.Error(w, "Proxy record mode requires an upstream target URL", http.StatusBadGateway)
 		return
@@ -653,6 +772,10 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 			s.cassette.Metadata.Model = resolvedModel
 		}
 		s.cassette.Interactions = append(s.cassette.Interactions, inter)
+		s.newEpisodes++
+		if markMatched {
+			s.matchedIDs[inter.ID] = true
+		}
 		s.mu.Unlock()
 		return
 	}
@@ -714,6 +837,10 @@ func (s *Server) handleRecord(w http.ResponseWriter, r *http.Request, candidate 
 		s.cassette.Metadata.Model = detectedModel
 	}
 	s.cassette.Interactions = append(s.cassette.Interactions, inter)
+	s.newEpisodes++
+	if markMatched {
+		s.matchedIDs[inter.ID] = true
+	}
 	s.mu.Unlock()
 
 	for k, vv := range resp.Header {

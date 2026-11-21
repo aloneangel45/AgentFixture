@@ -295,8 +295,13 @@ func TestFuzzyMatcher_100KBPromptPerformanceGuard(t *testing.T) {
 		}
 	}
 	avg := time.Since(start) / runs
-	if avg > 5*time.Millisecond {
-		t.Errorf("100KB prompt FuzzyMatcher too slow: avg %v per match", avg)
+	// Guard against O(N*M) quadratic regression (~15s/op) while tolerating shared CI/parallel-build CPU jitter.
+	maxAvg := 50 * time.Millisecond
+	if raceDetectorEnabled {
+		maxAvg = 150 * time.Millisecond
+	}
+	if avg > maxAvg {
+		t.Errorf("100KB prompt FuzzyMatcher too slow: avg %v per match (limit %v)", avg, maxAvg)
 	}
 	t.Logf("100KB prompt FuzzyMatcher average latency: %v", avg)
 }

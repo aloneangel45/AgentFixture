@@ -16,16 +16,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aloneangel45/AgentFixture/pkg/budget"
 	"github.com/aloneangel45/AgentFixture/pkg/cassette"
+	"github.com/aloneangel45/AgentFixture/pkg/chaos"
 	"github.com/aloneangel45/AgentFixture/pkg/importer"
 	"github.com/aloneangel45/AgentFixture/pkg/junit"
 	"github.com/aloneangel45/AgentFixture/pkg/matcher"
 	"github.com/aloneangel45/AgentFixture/pkg/proxy"
 	"github.com/aloneangel45/AgentFixture/pkg/runner"
+	"github.com/aloneangel45/AgentFixture/pkg/suite"
 )
 
 // Version is injected at build time via -ldflags="-X main.Version=...".
-var Version = "1.2.2"
+var Version = "1.3.0"
 
 const (
 	ProgramName = "AgentFixture"
@@ -61,6 +64,8 @@ func main() {
 		err = handleRecord(args)
 	case "replay":
 		err = handleReplay(args)
+	case "test":
+		err = handleTest(args)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -77,7 +82,7 @@ func main() {
 func formatVersionString(ver string) string {
 	clean := strings.TrimPrefix(strings.TrimSpace(ver), "v")
 	if clean == "" {
-		clean = "1.2.2"
+		clean = "1.3.0"
 	}
 	return fmt.Sprintf("%s v%s (%s)", ProgramName, clean, Banner)
 }
@@ -140,8 +145,9 @@ Usage:
 
 Commands:
   record     Record HTTP, SSE streaming (Anthropic, OpenAI, Gemini), or MCP stdio interactions
-  replay     Replay recorded cassette deterministically with zero outbound network calls
-  verify     Validate single cassette or recursive directory batch, schema, and secret safety
+  replay     Replay recorded cassette deterministically (with optional chaos & hybrid record-mode)
+  test       Run declarative YAML test suites or cassette directories in parallel
+  verify     Validate single cassette or recursive directory batch, schema, secrets, and budgets
   inspect    Display cassette telemetry, interaction summary, and reconstructed SSE streams
   redact     Scrub secrets from a cassette file and recompute secret-safe hashes
   import     Ingest TracePort flight recordings and convert to testing cassette
@@ -149,29 +155,110 @@ Commands:
   version    Show version information
 
 Examples:
-  agentfixture verify fixtures/
-  agentfixture verify -json -junit verify-report.xml fixtures/
+  agentfixture verify -max-tokens 50000 -max-cost-usd 0.25 -min-cache-hit-rate 0.30 fixtures/
+  agentfixture verify -json -junit verify-report.xml -github-summary fixtures/
+  agentfixture test -concurrency 4 -junit suite-report.xml -github-summary suite.yaml
+  agentfixture test -concurrency 4 -max-cost-usd 0.50 fixtures/
   agentfixture inspect fixtures/gemini_sse.yaml
   agentfixture redact fixtures/raw_capture.yaml
   agentfixture import -traceport flight.json -out cassette.yaml
   agentfixture replay -cassette cassette.yaml -timing instant -junit replay-report.xml -- go test ./...
+  agentfixture replay -cassette cassette.yaml -chaos-rate-limit 2 -chaos-seed 42 -- python agent.py
+  agentfixture replay -cassette cassette.yaml -record-mode new_episodes -upstream https://api.anthropic.com -- python agent.py
   agentfixture record -cassette cassette.yaml -upstream https://generativelanguage.googleapis.com -- python agent.py
   agentfixture record -mcp -cassette mcp_tools.yaml -- npx -y @modelcontextprotocol/server-filesystem .
   agentfixture diff -exit-code cassette_v1.yaml cassette_v2.yaml`)
 }
 
+type budgetCLIOpts struct {
+	maxTokens         int64
+	maxCostUSD        float64
+	minCacheHitRate   float64
+	pricingFile       string
+	githubSummary     bool
+	githubSummaryPath string
+}
+
+func registerBudgetFlags(fs *flag.FlagSet) *budgetCLIOpts {
+	opts := &budgetCLIOpts{}
+	fs.Int64Var(&opts.maxTokens, "max-tokens", 0, "Fail CI if total token count exceeds N (0 disables)")
+	fs.Float64Var(&opts.maxCostUSD, "max-cost-usd", 0, "Fail CI if estimated USD cost exceeds limit (0 disables)")
+	fs.Float64Var(&opts.minCacheHitRate, "min-cache-hit-rate", 0, "Fail CI if prompt cache hit rate [0.0..1.0] falls below threshold (0 disables)")
+	fs.StringVar(&opts.pricingFile, "pricing-file", "", "Optional JSON file overriding per-1M-token model pricing")
+	fs.BoolVar(&opts.githubSummary, "github-summary", false, "Append Markdown telemetry table to GITHUB_STEP_SUMMARY")
+	fs.StringVar(&opts.githubSummaryPath, "github-summary-path", "", "Explicit file path to append GitHub Step Summary Markdown")
+	return opts
+}
+
+func (b *budgetCLIOpts) resolve() (budget.Thresholds, *budget.PricingTable, string, error) {
+	th := budget.Thresholds{
+		MaxTokens:       b.maxTokens,
+		MaxCostUSD:      b.maxCostUSD,
+		MinCacheHitRate: b.minCacheHitRate,
+	}
+	if err := th.Validate(); err != nil {
+		return th, nil, "", err
+	}
+	tbl, err := budget.LoadPricingFile(b.pricingFile)
+	if err != nil {
+		return th, nil, "", err
+	}
+	sumPath := budget.ResolveSummaryPath(b.githubSummary, b.githubSummaryPath)
+	return th, tbl, sumPath, nil
+}
+
+type chaosCLIOpts struct {
+	seed         int64
+	rateLimit    int
+	overload     int
+	dropSSEAfter int
+	latencyMs    int64
+	jitterMs     int64
+	errorRate    float64
+}
+
+func registerChaosFlags(fs *flag.FlagSet) *chaosCLIOpts {
+	opts := &chaosCLIOpts{}
+	fs.Int64Var(&opts.seed, "chaos-seed", 42, "Deterministic PRNG seed for chaos fault injection")
+	fs.IntVar(&opts.rateLimit, "chaos-rate-limit", 0, "Inject HTTP 429 / MCP -32000 rate limit on first N requests")
+	fs.IntVar(&opts.overload, "chaos-overload", 0, "Inject HTTP 529 / MCP -32000 overloaded error on first N requests")
+	fs.IntVar(&opts.dropSSEAfter, "chaos-drop-sse-after", 0, "Deterministically truncate SSE streams after N events")
+	fs.Int64Var(&opts.latencyMs, "chaos-latency-ms", 0, "Deterministic added latency in milliseconds")
+	fs.Int64Var(&opts.jitterMs, "chaos-jitter-ms", 0, "Deterministic seeded latency jitter [0..ms] in milliseconds")
+	fs.Float64Var(&opts.errorRate, "chaos-error-rate", 0, "Deterministic seeded fault probability [0.0..1.0]")
+	return opts
+}
+
+func (c *chaosCLIOpts) buildInjector() (*chaos.Injector, error) {
+	cfg := chaos.Config{
+		Seed:            c.seed,
+		RateLimitFirstN: c.rateLimit,
+		OverloadFirstN:  c.overload,
+		DropSSEAfter:    c.dropSSEAfter,
+		LatencyMs:       c.latencyMs,
+		LatencyJitterMs: c.jitterMs,
+		ErrorRate:       c.errorRate,
+	}
+	if !cfg.Enabled() {
+		return nil, cfg.Validate()
+	}
+	return chaos.NewInjector(cfg)
+}
+
 type verifyFileResult struct {
-	Path                  string  `json:"path"`
-	Valid                 bool    `json:"valid"`
-	Version               string  `json:"version,omitempty"`
-	CassetteID            string  `json:"cassette_id,omitempty"`
-	Interactions          int     `json:"interactions"`
-	SSEStreams            int     `json:"sse_streams"`
-	EstimatedTokensSaved  int64   `json:"estimated_tokens_saved"`
-	EstimatedCostSavedUSD float64 `json:"estimated_cost_saved_usd"`
-	DurationMs            int64   `json:"duration_ms"`
-	ErrorType             string  `json:"error_type,omitempty"`
-	Error                 string  `json:"error,omitempty"`
+	Path                  string        `json:"path"`
+	Valid                 bool          `json:"valid"`
+	Version               string        `json:"version,omitempty"`
+	CassetteID            string        `json:"cassette_id,omitempty"`
+	Interactions          int           `json:"interactions"`
+	SSEStreams            int           `json:"sse_streams"`
+	EstimatedTokensSaved  int64         `json:"estimated_tokens_saved"`
+	EstimatedCostSavedUSD float64       `json:"estimated_cost_saved_usd"`
+	CacheHitRate          float64       `json:"cache_hit_rate,omitempty"`
+	Budget                budget.Report `json:"budget,omitempty"`
+	DurationMs            int64         `json:"duration_ms"`
+	ErrorType             string        `json:"error_type,omitempty"`
+	Error                 string        `json:"error,omitempty"`
 	duration              time.Duration
 }
 
@@ -186,10 +273,11 @@ type verifySummaryReport struct {
 	TotalSSEStreams       int                `json:"total_sse_streams"`
 	EstimatedTokensSaved  int64              `json:"estimated_tokens_saved"`
 	EstimatedCostSavedUSD float64            `json:"estimated_cost_saved_usd"`
+	Budget                budget.Report      `json:"budget,omitempty"`
 	Results               []verifyFileResult `json:"results"`
 }
 
-func verifySingleCassetteFile(casPath string, strictCheck bool) (verifyFileResult, error) {
+func verifySingleCassetteFile(casPath string, strictCheck bool, pricingTable *budget.PricingTable, thresholds budget.Thresholds) (verifyFileResult, error) {
 	start := time.Now()
 	res := verifyFileResult{
 		Path: filepath.ToSlash(casPath),
@@ -230,15 +318,27 @@ func verifySingleCassetteFile(casPath string, strictCheck bool) (verifyFileResul
 	}
 
 	cas.ComputeMetrics()
+	bRep := budget.Evaluate(cas, pricingTable, thresholds)
+
 	res.duration = time.Since(start)
 	res.DurationMs = res.duration.Milliseconds()
-	res.Valid = true
 	res.Version = cas.Version
 	res.CassetteID = cas.Metadata.CassetteID
 	res.Interactions = cas.Metadata.Metrics.TotalInteractions
 	res.SSEStreams = sseCount
 	res.EstimatedTokensSaved = cas.Metadata.Metrics.EstimatedTokensSaved
 	res.EstimatedCostSavedUSD = cas.Metadata.Metrics.EstimatedCostSavedUSD
+	res.CacheHitRate = bRep.CacheHitRate
+	res.Budget = bRep
+
+	if !bRep.Passed {
+		res.Valid = false
+		res.ErrorType = "BudgetViolation"
+		res.Error = "budget violation: " + bRep.ViolationSummary()
+		return res, fmt.Errorf("%s", res.Error)
+	}
+
+	res.Valid = true
 	return res, nil
 }
 
@@ -293,7 +393,13 @@ func handleVerify(args []string) error {
 	strictCheck := flagSet.Bool("strict", true, "Enforce strict schema validation")
 	jsonOut := flagSet.Bool("json", false, "Emit structured JSON verification report")
 	junitPath := flagSet.String("junit", "", "Write JUnit XML verification report to path")
+	bFlags := registerBudgetFlags(flagSet)
 	if err := flagSet.Parse(permuteFlagsFirst(flagSet, args)); err != nil {
+		return err
+	}
+
+	thresholds, pricingTable, summaryPath, err := bFlags.resolve()
+	if err != nil {
 		return err
 	}
 
@@ -334,8 +440,40 @@ func handleVerify(args []string) error {
 		return fmt.Errorf("failed to load cassette: %w", statErr)
 	}
 
+	writeVerifyGitHubSummary := func(rep verifySummaryReport) error {
+		if summaryPath == "" {
+			return nil
+		}
+		rows := make([]budget.SummaryRow, 0, len(rep.Results))
+		for _, r := range rep.Results {
+			note := "valid"
+			if !r.Valid {
+				note = r.Error
+			}
+			tok := r.Budget.TotalTokens
+			if tok == 0 {
+				tok = r.EstimatedTokensSaved
+			}
+			cost := r.Budget.EstimatedCostUSD
+			if cost == 0 {
+				cost = r.EstimatedCostSavedUSD
+			}
+			rows = append(rows, budget.SummaryRow{
+				Name:         r.Path,
+				Passed:       r.Valid,
+				Interactions: r.Interactions,
+				TotalTokens:  tok,
+				CostUSD:      cost,
+				CacheHitRate: r.CacheHitRate,
+				Details:      note,
+			})
+		}
+		md := budget.FormatSummaryMarkdown("Verification ("+rep.Target+")", rows, rep.Budget, rep.Passed)
+		return budget.AppendGitHubSummary(summaryPath, md)
+	}
+
 	if !info.IsDir() {
-		res, verifyErr := verifySingleCassetteFile(targetPath, *strictCheck)
+		res, verifyErr := verifySingleCassetteFile(targetPath, *strictCheck, pricingTable, thresholds)
 		rep := verifySummaryReport{
 			Target:                filepath.ToSlash(targetPath),
 			Mode:                  "file",
@@ -345,6 +483,7 @@ func handleVerify(args []string) error {
 			TotalSSEStreams:       res.SSEStreams,
 			EstimatedTokensSaved:  res.EstimatedTokensSaved,
 			EstimatedCostSavedUSD: res.EstimatedCostSavedUSD,
+			Budget:                res.Budget,
 			Results:               []verifyFileResult{res},
 		}
 		if res.Valid {
@@ -358,6 +497,9 @@ func handleVerify(args []string) error {
 			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
 				return wErr
 			}
+		}
+		if sErr := writeVerifyGitHubSummary(rep); sErr != nil {
+			return sErr
 		}
 
 		if *jsonOut {
@@ -379,6 +521,9 @@ func handleVerify(args []string) error {
 		fmt.Printf("    Interactions:           %d (SSE streams: %d)\n", res.Interactions, res.SSEStreams)
 		fmt.Printf("    Estimated Tokens Saved: %d\n", res.EstimatedTokensSaved)
 		fmt.Printf("    Estimated Cost Saved:   $%.4f USD\n", res.EstimatedCostSavedUSD)
+		if res.Budget.TotalTokens > 0 || res.CacheHitRate > 0 {
+			fmt.Printf("    Budget Cost / Cache:    $%.4f USD (cache hit rate: %.1f%%)\n", res.Budget.EstimatedCostUSD, res.CacheHitRate*100)
+		}
 		return nil
 	}
 
@@ -422,8 +567,10 @@ func handleVerify(args []string) error {
 		Results:        make([]verifyFileResult, 0, len(files)),
 	}
 
+	budgetReports := make([]budget.Report, 0, len(files))
 	for _, fPath := range files {
-		res, _ := verifySingleCassetteFile(fPath, *strictCheck)
+		res, _ := verifySingleCassetteFile(fPath, *strictCheck, pricingTable, thresholds)
+		budgetReports = append(budgetReports, res.Budget)
 		if res.Valid {
 			rep.ValidCassettes++
 			rep.TotalInteractions += res.Interactions
@@ -435,13 +582,17 @@ func handleVerify(args []string) error {
 		}
 		rep.Results = append(rep.Results, res)
 	}
-	rep.Passed = rep.FailedCassettes == 0
+	rep.Budget = budget.Aggregate(budgetReports, thresholds)
+	rep.Passed = rep.FailedCassettes == 0 && rep.Budget.Passed
 
 	if *junitPath != "" {
 		suites := junit.BuildVerifySuites(targetPath, toJUnitVerifyCases(rep.Results), rep.EstimatedTokensSaved, rep.EstimatedCostSavedUSD, time.Since(suiteStart))
 		if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
 			return wErr
 		}
+	}
+	if sErr := writeVerifyGitHubSummary(rep); sErr != nil {
+		return sErr
 	}
 
 	if *jsonOut {
@@ -451,6 +602,9 @@ func handleVerify(args []string) error {
 			return encErr
 		}
 		if !rep.Passed {
+			if !rep.Budget.Passed {
+				return fmt.Errorf("batch budget check failed: %s", rep.Budget.ViolationSummary())
+			}
 			return fmt.Errorf("batch verification failed: %d of %d cassette(s) failed", rep.FailedCassettes, rep.TotalCassettes)
 		}
 		return nil
@@ -461,8 +615,8 @@ func handleVerify(args []string) error {
 	fmt.Println("=================================================================")
 	for _, r := range rep.Results {
 		if r.Valid {
-			fmt.Printf(" [OK]   %s (id=%s, interactions=%d, sse=%d, tokens=%d, saved=$%.4f)\n",
-				r.Path, r.CassetteID, r.Interactions, r.SSEStreams, r.EstimatedTokensSaved, r.EstimatedCostSavedUSD)
+			fmt.Printf(" [OK]   %s (id=%s, interactions=%d, sse=%d, tokens=%d, saved=$%.4f, cache=%.1f%%)\n",
+				r.Path, r.CassetteID, r.Interactions, r.SSEStreams, r.EstimatedTokensSaved, r.EstimatedCostSavedUSD, r.CacheHitRate*100)
 		} else {
 			fmt.Printf(" [FAIL] %s: %s\n", r.Path, r.Error)
 		}
@@ -474,9 +628,16 @@ func handleVerify(args []string) error {
 		rep.TotalInteractions, rep.TotalSSEStreams)
 	fmt.Printf(" Estimated Tokens Saved: %d\n", rep.EstimatedTokensSaved)
 	fmt.Printf(" Estimated Cost Saved:   $%.4f USD\n", rep.EstimatedCostSavedUSD)
+	fmt.Printf(" Prompt Cache Hit Rate:  %.1f%%\n", rep.Budget.CacheHitRate*100)
+	if !rep.Budget.Passed {
+		fmt.Printf(" Budget Violations:      %s\n", rep.Budget.ViolationSummary())
+	}
 	fmt.Println("=================================================================")
 
 	if !rep.Passed {
+		if !rep.Budget.Passed && rep.FailedCassettes == 0 {
+			return fmt.Errorf("batch budget check failed: %s", rep.Budget.ViolationSummary())
+		}
 		return fmt.Errorf("batch verification failed: %d of %d cassette(s) failed", rep.FailedCassettes, rep.TotalCassettes)
 	}
 	return nil
@@ -849,9 +1010,15 @@ func handleRecord(args []string) error {
 	upstream := fs.String("upstream", "", "Upstream target URL to forward HTTP/SSE requests to")
 	listenAddr := fs.String("addr", "127.0.0.1:0", "Local address to bind proxy on")
 	mcpMode := fs.Bool("mcp", false, "Record an MCP stdio server subprocess instead of an HTTP proxy")
+	recordModeStr := fs.String("record-mode", "all", "Record mode: all (default), new_episodes (keep existing and record unmatched), or none")
 
 	flagArgs, cmdArgs := splitDashArgs(args)
 	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
+		return err
+	}
+
+	recordMode, err := proxy.ParseRecordMode(*recordModeStr)
+	if err != nil {
 		return err
 	}
 
@@ -874,13 +1041,33 @@ func handleRecord(args []string) error {
 		return runErr
 	}
 
+	if recordMode == proxy.RecordModeNewEpisodes {
+		if existing, loadErr := cassette.Load(*casPath); loadErr == nil {
+			cas = existing
+		} else if !os.IsNotExist(loadErr) {
+			return fmt.Errorf("failed to load existing cassette for new_episodes: %w", loadErr)
+		}
+	} else if recordMode == proxy.RecordModeNone {
+		existing, loadErr := cassette.Load(*casPath)
+		if loadErr != nil {
+			return fmt.Errorf("failed to load cassette: %w", loadErr)
+		}
+		cas = existing
+	}
+
 	cas.Metadata.Source = "agentfixture_record_proxy"
-	if *upstream == "" {
+	if recordMode != proxy.RecordModeNone && *upstream == "" {
 		*upstream = "https://api.anthropic.com"
 	}
 
+	proxyMode := proxy.ModeRecord
+	if recordMode == proxy.RecordModeNone {
+		proxyMode = proxy.ModeReplay
+	}
+
 	srv, err := proxy.NewServer(proxy.Config{
-		Mode:        proxy.ModeRecord,
+		Mode:        proxyMode,
+		RecordMode:  recordMode,
 		UpstreamURL: *upstream,
 		Cassette:    cas,
 		ListenAddr:  *listenAddr,
@@ -893,17 +1080,20 @@ func handleRecord(args []string) error {
 	}
 	defer srv.Close()
 
-	fmt.Printf("[INFO] AgentFixture Recording Proxy active on %s\n", srv.URL())
-	fmt.Printf("       Forwarding to Upstream: %s\n", *upstream)
+	fmt.Printf("[INFO] AgentFixture Recording Proxy active on %s (record-mode=%s)\n", srv.URL(), recordMode)
+	if *upstream != "" {
+		fmt.Printf("       Forwarding to Upstream: %s\n", *upstream)
+	}
 
 	var cmdExecErr error
 	if len(cmdArgs) > 0 {
 		fmt.Printf("[INFO] Spawning command: %s\n", strings.Join(cmdArgs, " "))
 		rep, runErr := runner.Run(runner.RunOptions{
-			Cassette: cas,
-			Mode:     proxy.ModeRecord,
-			Server:   srv,
-			Command:  cmdArgs,
+			Cassette:   cas,
+			Mode:       proxyMode,
+			RecordMode: recordMode,
+			Server:     srv,
+			Command:    cmdArgs,
 		})
 		if runErr != nil {
 			return runErr
@@ -919,12 +1109,13 @@ func handleRecord(args []string) error {
 		<-sigChan
 	}
 
-	recCas := srv.GetCassette()
-	if err := cassette.Save(*casPath, recCas); err != nil {
-		return fmt.Errorf("failed to save cassette: %w", err)
+	if recordMode != proxy.RecordModeNone {
+		recCas := srv.GetCassette()
+		if err := cassette.Save(*casPath, recCas); err != nil {
+			return fmt.Errorf("failed to save cassette: %w", err)
+		}
+		fmt.Printf("[OK] Cassette saved to %s (%d interactions total, %d new)\n", *casPath, len(recCas.Interactions), srv.NewEpisodesCount())
 	}
-
-	fmt.Printf("[OK] Cassette saved to %s (%d interactions recorded)\n", *casPath, len(recCas.Interactions))
 	return cmdExecErr
 }
 
@@ -940,6 +1131,10 @@ func handleReplay(args []string) error {
 	maxDelay := fs.Duration("max-delay", 2*time.Second, "Maximum per-chunk delay cap in scaled/exact SSE replay (0 for uncapped)")
 	mcpMode := fs.Bool("mcp", false, "Run deterministic MCP JSON-RPC replay over stdin/stdout")
 	junitPath := fs.String("junit", "", "Write JUnit XML regression report to path")
+	recordModeStr := fs.String("record-mode", "none", "Record mode: none (strict offline replay), new_episodes (replay matched, record unmatched), or all")
+	upstream := fs.String("upstream", "", "Upstream target URL (required when -record-mode is new_episodes or all)")
+	cFlags := registerChaosFlags(fs)
+	bFlags := registerBudgetFlags(fs)
 
 	flagArgs, cmdArgs := splitDashArgs(args)
 	if err := fs.Parse(permuteFlagsFirst(fs, flagArgs)); err != nil {
@@ -948,6 +1143,23 @@ func handleReplay(args []string) error {
 
 	if *casPath == "" {
 		return fmt.Errorf("-cassette <path> is required")
+	}
+
+	recordMode, err := proxy.ParseRecordMode(*recordModeStr)
+	if err != nil {
+		return err
+	}
+	if (recordMode == proxy.RecordModeNewEpisodes || recordMode == proxy.RecordModeAll) && strings.TrimSpace(*upstream) == "" {
+		return fmt.Errorf("-upstream <url> is required when -record-mode=%s", recordMode)
+	}
+
+	chaosInj, err := cFlags.buildInjector()
+	if err != nil {
+		return err
+	}
+	thresholds, pricingTable, summaryPath, err := bFlags.resolve()
+	if err != nil {
+		return err
 	}
 
 	sseMode, err := cassette.ParseSSETimingMode(*timingStr)
@@ -960,9 +1172,29 @@ func handleReplay(args []string) error {
 		MaxChunkDelay: *maxDelay,
 	}
 
-	cas, err := cassette.Load(*casPath)
-	if err != nil {
-		return fmt.Errorf("failed to load cassette: %w", err)
+	var cas *cassette.Cassette
+	casExisted := true
+	switch recordMode {
+	case proxy.RecordModeAll:
+		cas = cassette.NewCassette(fmt.Sprintf("cas_record_%d", time.Now().Unix()))
+		cas.Metadata.Source = "agentfixture_record_proxy"
+		casExisted = false
+	case proxy.RecordModeNewEpisodes:
+		cas, err = cassette.Load(*casPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				cas = cassette.NewCassette(fmt.Sprintf("cas_hybrid_%d", time.Now().Unix()))
+				cas.Metadata.Source = "agentfixture_hybrid_proxy"
+				casExisted = false
+			} else {
+				return fmt.Errorf("failed to load cassette: %w", err)
+			}
+		}
+	default:
+		cas, err = cassette.Load(*casPath)
+		if err != nil {
+			return fmt.Errorf("failed to load cassette: %w", err)
+		}
 	}
 
 	var m matcher.Matcher
@@ -975,11 +1207,36 @@ func handleReplay(args []string) error {
 	if *mcpMode {
 		start := time.Now()
 		replayer := proxy.NewStdioReplayer(cas, m)
+		if chaosInj != nil {
+			replayer.SetChaos(chaosInj)
+		}
 		runErr := replayer.ProcessStream(os.Stdin, os.Stdout)
+		bRep := budget.Evaluate(cas, pricingTable, thresholds)
+		if runErr == nil && !bRep.Passed {
+			runErr = fmt.Errorf("budget check failed: %s", bRep.ViolationSummary())
+		}
 		if *junitPath != "" {
 			suites := junit.BuildMCPReplaySuites(cas, *casPath, time.Since(start), runErr)
 			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
 				return wErr
+			}
+		}
+		if summaryPath != "" {
+			note := "mcp replay ok"
+			if runErr != nil {
+				note = runErr.Error()
+			}
+			md := budget.FormatSummaryMarkdown("MCP Replay", []budget.SummaryRow{{
+				Name:         filepath.ToSlash(*casPath),
+				Passed:       runErr == nil,
+				Interactions: len(cas.Interactions),
+				TotalTokens:  bRep.TotalTokens,
+				CostUSD:      bRep.EstimatedCostUSD,
+				CacheHitRate: bRep.CacheHitRate,
+				Details:      note,
+			}}, bRep, runErr == nil)
+			if sErr := budget.AppendGitHubSummary(summaryPath, md); sErr != nil {
+				return sErr
 			}
 		}
 		return runErr
@@ -987,22 +1244,62 @@ func handleReplay(args []string) error {
 
 	if len(cmdArgs) > 0 {
 		report, err := runner.Run(runner.RunOptions{
-			Cassette:   cas,
-			Matcher:    m,
-			Command:    cmdArgs,
-			StrictMode: *strictMode,
-			SSETiming:  sseTiming,
+			Cassette:    cas,
+			Matcher:     m,
+			Command:     cmdArgs,
+			StrictMode:  *strictMode,
+			Mode:        proxy.ModeReplay,
+			RecordMode:  recordMode,
+			UpstreamURL: *upstream,
+			SSETiming:   sseTiming,
+			Chaos:       chaosInj,
 		})
 		if err != nil {
 			return err
 		}
+
+		if recordMode == proxy.RecordModeAll || (recordMode == proxy.RecordModeNewEpisodes && (report.NewEpisodes > 0 || !casExisted)) {
+			if saveErr := cassette.Save(*casPath, cas); saveErr != nil {
+				return fmt.Errorf("failed to save updated cassette: %w", saveErr)
+			}
+			fmt.Printf("[OK] Saved updated cassette to %s (%d interactions, %d new episodes)\n", *casPath, len(cas.Interactions), report.NewEpisodes)
+		}
+
+		bRep := budget.Evaluate(cas, pricingTable, thresholds)
+		if !bRep.Passed {
+			report.Passed = false
+		}
+
 		if *junitPath != "" {
 			suites := junit.BuildReplaySuites(cas, *casPath, report)
 			if wErr := junit.WriteFile(*junitPath, suites); wErr != nil {
 				return wErr
 			}
 		}
+		if summaryPath != "" {
+			note := fmt.Sprintf("matched %d/%d", report.MatchedCount, report.TotalExpected)
+			if !bRep.Passed {
+				note = bRep.ViolationSummary()
+			} else if !report.Passed {
+				note = fmt.Sprintf("exit=%d unmatched=%d unexpected=%d", report.CommandExitCode, len(report.UnmatchedExpected), len(report.UnexpectedCalls))
+			}
+			md := budget.FormatSummaryMarkdown("Replay", []budget.SummaryRow{{
+				Name:         filepath.ToSlash(*casPath),
+				Passed:       report.Passed,
+				Interactions: report.TotalExpected,
+				TotalTokens:  bRep.TotalTokens,
+				CostUSD:      bRep.EstimatedCostUSD,
+				CacheHitRate: bRep.CacheHitRate,
+				Details:      note,
+			}}, bRep, report.Passed)
+			if sErr := budget.AppendGitHubSummary(summaryPath, md); sErr != nil {
+				return sErr
+			}
+		}
 		fmt.Print(report.FormatSummary())
+		if !bRep.Passed {
+			return fmt.Errorf("budget check failed: %s", bRep.ViolationSummary())
+		}
 		if !report.Passed {
 			return fmt.Errorf("regression check failed")
 		}
@@ -1011,11 +1308,14 @@ func handleReplay(args []string) error {
 
 	// Standalone replay server
 	srv, err := proxy.NewServer(proxy.Config{
-		Mode:       proxy.ModeReplay,
-		Cassette:   cas,
-		Matcher:    m,
-		ListenAddr: *listenAddr,
-		SSETiming:  sseTiming,
+		Mode:        proxy.ModeReplay,
+		RecordMode:  recordMode,
+		UpstreamURL: *upstream,
+		Cassette:    cas,
+		Matcher:     m,
+		ListenAddr:  *listenAddr,
+		SSETiming:   sseTiming,
+		Chaos:       chaosInj,
 	})
 	if err != nil {
 		return err
@@ -1026,13 +1326,139 @@ func handleReplay(args []string) error {
 	defer srv.Close()
 
 	fmt.Printf("[OK] AgentFixture Replay Server active on %s\n", srv.URL())
-	fmt.Printf("    Loaded:     %s (%d interactions)\n", *casPath, len(cas.Interactions))
-	fmt.Printf("    SSE Timing: %s\n", sseTiming.Mode)
-	fmt.Println("    Running in zero-token offline replay mode. Press Ctrl+C to stop.")
+	fmt.Printf("    Loaded:      %s (%d interactions)\n", *casPath, len(cas.Interactions))
+	fmt.Printf("    Record Mode: %s\n", recordMode)
+	fmt.Printf("    SSE Timing:  %s\n", sseTiming.Mode)
+	if chaosInj != nil && chaosInj.Enabled() {
+		fmt.Printf("    Chaos Mode:  ENABLED (seed=%d)\n", cFlags.seed)
+	}
+	if recordMode == proxy.RecordModeNone {
+		fmt.Println("    Running in zero-token offline replay mode. Press Ctrl+C to stop.")
+	} else {
+		fmt.Printf("    Upstream:    %s. Press Ctrl+C to save updated cassette and stop.\n", *upstream)
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 
+	if recordMode == proxy.RecordModeAll || (recordMode == proxy.RecordModeNewEpisodes && (srv.NewEpisodesCount() > 0 || !casExisted)) {
+		updated := srv.GetCassette()
+		if saveErr := cassette.Save(*casPath, updated); saveErr != nil {
+			return fmt.Errorf("failed to save updated cassette: %w", saveErr)
+		}
+		fmt.Printf("[OK] Saved updated cassette to %s (%d interactions, %d new episodes)\n", *casPath, len(updated.Interactions), srv.NewEpisodesCount())
+	}
+
+	return nil
+}
+
+func handleTest(args []string) error {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	concurrency := fs.Int("concurrency", 4, "Maximum parallel test cases to execute concurrently")
+	jsonOut := fs.Bool("json", false, "Emit structured JSON suite report")
+	junitPath := fs.String("junit", "", "Write JUnit XML suite report to path")
+	bFlags := registerBudgetFlags(fs)
+
+	if err := fs.Parse(permuteFlagsFirst(fs, args)); err != nil {
+		return err
+	}
+
+	thresholds, pricingTable, summaryPath, err := bFlags.resolve()
+	if err != nil {
+		return err
+	}
+
+	rest := fs.Args()
+	if len(rest) < 1 {
+		return fmt.Errorf("usage: agentfixture test [options] <suite.yaml | fixtures-dir>")
+	}
+	target := rest[0]
+
+	info, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("failed to access test target %q: %w", target, err)
+	}
+
+	var spec *suite.SuiteSpec
+	var baseDir string
+	if info.IsDir() {
+		spec, err = suite.DiscoverDirectorySuite(target, suite.CaseDefaults{})
+		if err != nil {
+			return err
+		}
+	} else {
+		spec, err = suite.LoadSuiteFile(target)
+		if err != nil {
+			return err
+		}
+		baseDir = filepath.Dir(target)
+	}
+
+	// Only override pricingTable if user explicitly passed -pricing-file; otherwise let suite defaults apply.
+	var runPricing *budget.PricingTable
+	if strings.TrimSpace(bFlags.pricingFile) != "" {
+		runPricing = pricingTable
+	}
+
+	report, err := suite.Run(spec, suite.RunOptions{
+		Concurrency:   *concurrency,
+		BaseDir:       baseDir,
+		Source:        target,
+		PricingTable:  runPricing,
+		DefaultBudget: thresholds,
+	})
+	if err != nil {
+		return err
+	}
+
+	if *junitPath != "" {
+		jCases := make([]junit.SuiteCaseInput, 0, len(report.Cases))
+		for _, c := range report.Cases {
+			jCases = append(jCases, junit.SuiteCaseInput{
+				Name:             c.Name,
+				Cassette:         c.Cassette,
+				Mode:             c.Mode,
+				Passed:           c.Passed,
+				Interactions:     c.Interactions,
+				Turns:            c.Turns,
+				TotalTokens:      c.Budget.TotalTokens,
+				EstimatedCostUSD: c.Budget.EstimatedCostUSD,
+				CacheHitRate:     c.Budget.CacheHitRate,
+				Duration:         c.Duration,
+				Failures:         c.Failures,
+			})
+		}
+		jSuites := junit.BuildSuiteSuites(report.Name, jCases, report.Budget.TotalTokens, report.Budget.EstimatedCostUSD, report.Budget.CacheHitRate, report.Duration)
+		if wErr := junit.WriteFile(*junitPath, jSuites); wErr != nil {
+			return wErr
+		}
+	}
+
+	if summaryPath != "" {
+		if sErr := budget.AppendGitHubSummary(summaryPath, report.ToGitHubSummaryMarkdown()); sErr != nil {
+			return sErr
+		}
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(report); encErr != nil {
+			return encErr
+		}
+		if !report.Passed {
+			return fmt.Errorf("test suite failed: %d of %d case(s) failed", report.FailedCases, report.TotalCases)
+		}
+		return nil
+	}
+
+	fmt.Print(report.FormatSummary())
+	if !report.Passed {
+		if report.FailedCases == 0 && !report.Budget.Passed {
+			return fmt.Errorf("test suite budget failed: %s", report.Budget.ViolationSummary())
+		}
+		return fmt.Errorf("test suite failed: %d of %d case(s) failed", report.FailedCases, report.TotalCases)
+	}
 	return nil
 }
